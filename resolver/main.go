@@ -16,8 +16,8 @@
 //
 // Facets project/environment coordinates are resolved per coordinates.go's
 // package doc: a lazy, per-Application live LIST lookup keyed on
-// --namespace/--name-template first, falling back to
-// FACETS_PROJECT/FACETS_ENVIRONMENT.
+// --namespace/--name-template — the only coordinate source; there is no
+// repo-server-wide fallback.
 package main
 
 import (

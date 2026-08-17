@@ -1,32 +1,26 @@
 // coordinates.go
-// Facets project/environment coordinate resolution for shim mode. Comes
-// from one of two places, in order:
+// Facets project/environment coordinate resolution for shim mode. Per-app
+// annotations are the ONLY coordinate source — a live, lazy Kubernetes LIST
+// lookup, not a shared file, not a separate daemon, and no repo-server-wide
+// fallback of any kind.
 //
-//  1. Per-Application, via a live lookup — not a shared file, not a separate
-//     daemon. The shim forwards --namespace/--name-template (extracted from
-//     real helm's own argv — a live probe of a real argocd-repo-server found
-//     `--name-template <name>` and `--namespace <ns>` always present in the
-//     exec'd argv, even though no ARGOCD_APP_* env vars exist for a
-//     builtin, non-CMP Helm render). If both are non-empty, this builds an
-//     in-cluster kube client — lazily, only at this point, never on the
-//     zero-ref or flags-absent paths — and LISTs Application CRs in
-//     FACETS_ARGOCD_NAMESPACE, looking for exactly one whose
-//     spec.destination.namespace/effective release name match and which
-//     carries both facets.cloud/project and facets.cloud/environment
-//     annotations.
-//  2. Repo-server-wide fallback: FACETS_PROJECT/FACETS_ENVIRONMENT, set
-//     once on the argocd-repo-server deployment — one Argo CD (repo-server)
-//     mapped to one Facets project+environment context for every
-//     Application it renders that isn't (or can't be) resolved per-app.
+// The shim forwards --namespace/--name-template (extracted from real helm's
+// own argv — a live probe of a real argocd-repo-server found
+// `--name-template <name>` and `--namespace <ns>` always present in the
+// exec'd argv, even though no ARGOCD_APP_* env vars exist for a builtin,
+// non-CMP Helm render). Whenever the rendered stream contains any
+// ${facets:...} ref, both flags are required: this builds an in-cluster kube
+// client — lazily, only at this point, never on the zero-ref path — and
+// LISTs Application CRs in FACETS_ARGOCD_NAMESPACE, looking for exactly one
+// whose spec.destination.namespace/effective release name match and which
+// carries both facets.cloud/project and facets.cloud/environment
+// annotations.
 //
-// A per-Application lookup that runs but fails outright — a Kubernetes API
-// error, or an AMBIGUOUS match (more than one Application with the same
-// destination namespace + effective release name) — is a hard, fail-closed
-// error: it never silently falls through to the env-var fallback, since a
-// transient API blip resolving against the wrong environment's fallback
-// would be worse than failing loudly. Only a *clean* non-match (zero
-// matching Applications, or a match that simply doesn't carry both
-// annotations) falls through to (2).
+// Every failure mode is a hard, fail-closed error — there is no fallback to
+// silently resolve against: missing flags, a Kubernetes API error, zero
+// matching Applications, a match missing one or both annotations, or an
+// AMBIGUOUS match (more than one Application with the same destination
+// namespace + effective release name) all abort the render.
 package main
 
 import (
@@ -54,75 +48,49 @@ var appGVR = schema.GroupVersionResource{Group: "argoproj.io", Version: "v1alpha
 // per-Application LIST lookup. It's called at most once, and only when
 // --namespace and --name-template are both non-empty AND a ref has actually
 // been found in the rendered stream — never on the zero-ref passthrough
-// path, and never when the flags are absent.
+// path, and never when either flag is empty.
 type ConfigProvider func() (*rest.Config, error)
 
-// resolveCoordinates implements the resolution order documented above: (1) a
-// live per-Application LIST lookup, attempted only when namespace and
-// nameTemplate are both non-empty; a hard error there (API error, or an
-// ambiguous multi-match) returns immediately and never falls through to (2).
-// A clean non-match (zero matches, or a match without both annotations)
-// falls through normally to (2) FACETS_PROJECT/FACETS_ENVIRONMENT. If
-// neither yields usable coordinates, every reason why is returned: the
-// per-app non-match (if that path was attempted) and/or which env var(s)
-// are unset.
+// resolveCoordinates resolves Facets project/environment via the sole
+// mechanism described in the package doc: a live per-Application LIST
+// lookup, keyed on namespace+nameTemplate. Both must be non-empty — refs are
+// present in the stream (the only case this is called for), so there is no
+// meaningful fallback identity to resolve against, and an empty flag is
+// itself a hard, immediate error (no kube client is ever built for it).
 func resolveCoordinates(namespace, nameTemplate string, getKubeCfg ConfigProvider) (project, environment string, errs []error) {
-	attemptedPerApp := false
-	if namespace != "" && nameTemplate != "" {
-		attemptedPerApp = true
-		argoNS := os.Getenv("FACETS_ARGOCD_NAMESPACE")
-		if argoNS == "" {
-			argoNS = "argocd"
-		}
-		p, e, found, err := perAppCoordinates(getKubeCfg, argoNS, namespace, nameTemplate)
-		if err != nil {
-			// Hard error: fail closed, never fall through to the env
-			// fallback below — a transient API blip must not silently
-			// resolve against the wrong (repo-server-wide) environment.
-			return "", "", []error{err}
-		}
-		if found {
-			return p, e, nil
-		}
+	if namespace == "" || nameTemplate == "" {
+		return "", "", []error{errors.New("rendered manifests contain ${facets:...} refs but --namespace and --name-template were not both provided; per-Application coordinate resolution requires both to identify the Application")}
 	}
 
-	envProject := os.Getenv("FACETS_PROJECT")
-	envEnvironment := os.Getenv("FACETS_ENVIRONMENT")
-	if envProject != "" && envEnvironment != "" {
-		return envProject, envEnvironment, nil
+	argoNS := os.Getenv("FACETS_ARGOCD_NAMESPACE")
+	if argoNS == "" {
+		argoNS = "argocd"
 	}
-
-	if attemptedPerApp {
-		errs = append(errs, fmt.Errorf("rendered manifests contain ${facets:...} refs but no Application with both facets.cloud annotations matches destination namespace %q and release name %q", namespace, nameTemplate))
+	p, e, err := perAppCoordinates(getKubeCfg, argoNS, namespace, nameTemplate)
+	if err != nil {
+		return "", "", []error{err}
 	}
-	if envProject == "" {
-		errs = append(errs, errors.New("rendered manifests contain ${facets:...} refs but FACETS_PROJECT is not set"))
-	}
-	if envEnvironment == "" {
-		errs = append(errs, errors.New("rendered manifests contain ${facets:...} refs but FACETS_ENVIRONMENT is not set"))
-	}
-	return "", "", errs
+	return p, e, nil
 }
 
 // perAppCoordinates lists Application CRs in argoNS and looks for exactly
 // one whose spec.destination.namespace and effective release name (see
-// releaseKey) equal destNamespace/nameTemplate. found=false, err=nil means
-// "no matching Application, or a match without both facets.cloud
-// annotations" — a clean non-match the caller should fall through on. Any
-// API error, or more than one match, is returned as a non-nil err — a hard
-// stop, not a clean non-match.
-func perAppCoordinates(getKubeCfg ConfigProvider, argoNS, destNamespace, nameTemplate string) (project, environment string, found bool, err error) {
+// releaseKey) equal destNamespace/nameTemplate. Every non-exactly-one
+// outcome is a hard error: a Kubernetes API error, zero matches, a match
+// missing one or both facets.cloud annotations, or more than one match
+// (ambiguous).
+func perAppCoordinates(getKubeCfg ConfigProvider, argoNS, destNamespace, nameTemplate string) (project, environment string, err error) {
 	cfg, err := getKubeCfg()
 	if err != nil {
-		return "", "", false, fmt.Errorf("in-cluster kube config: %w", err)
+		return "", "", fmt.Errorf("in-cluster kube config: %w", err)
 	}
 	dc, err := dynamic.NewForConfig(cfg)
 	if err != nil {
-		return "", "", false, fmt.Errorf("building dynamic client: %w", err)
+		return "", "", fmt.Errorf("building dynamic client: %w", err)
 	}
 	list, err := dc.Resource(appGVR).Namespace(argoNS).List(context.Background(), metav1.ListOptions{})
 	if err != nil {
-		return "", "", false, fmt.Errorf("listing Applications in %s: %w", argoNS, err)
+		return "", "", fmt.Errorf("listing Applications in %s: %w", argoNS, err)
 	}
 
 	var matches []*unstructured.Unstructured
@@ -136,21 +104,30 @@ func perAppCoordinates(getKubeCfg ConfigProvider, argoNS, destNamespace, nameTem
 
 	switch len(matches) {
 	case 0:
-		return "", "", false, nil
+		return "", "", fmt.Errorf("no Application found with destination namespace %q and release name %q in %s", destNamespace, nameTemplate, argoNS)
 	case 1:
-		ann := matches[0].GetAnnotations()
+		app := matches[0]
+		ann := app.GetAnnotations()
 		p := ann[annotationProject]
 		e := ann[annotationEnvironment]
-		if p == "" || e == "" {
-			return "", "", false, nil
+		var missing []string
+		if p == "" {
+			missing = append(missing, annotationProject)
 		}
-		return p, e, true, nil
+		if e == "" {
+			missing = append(missing, annotationEnvironment)
+		}
+		if len(missing) > 0 {
+			return "", "", fmt.Errorf("Application %s/%s matches destination namespace %q and release name %q but is missing annotation(s): %s",
+				app.GetNamespace(), app.GetName(), destNamespace, nameTemplate, strings.Join(missing, ", "))
+		}
+		return p, e, nil
 	default:
 		names := make([]string, 0, len(matches))
 		for _, m := range matches {
 			names = append(names, m.GetNamespace()+"/"+m.GetName())
 		}
-		return "", "", false, fmt.Errorf("ambiguous: %d Applications in %s match destination namespace %q and release name %q: %s", len(matches), argoNS, destNamespace, nameTemplate, strings.Join(names, ", "))
+		return "", "", fmt.Errorf("ambiguous: %d Applications in %s match destination namespace %q and release name %q: %s", len(matches), argoNS, destNamespace, nameTemplate, strings.Join(names, ", "))
 	}
 }
 

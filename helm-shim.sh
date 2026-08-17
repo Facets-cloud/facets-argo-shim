@@ -35,9 +35,10 @@ FACETS_RESOLVER_BIN=${FACETS_RESOLVER_BIN:-/custom-tools/facets-resolver}
 # (space-separated, not "--flag=value" form, but both forms are handled here
 # for robustness), even though no ARGOCD_APP_* env vars exist for a builtin
 # (non-CMP) Helm render. Either may legitimately be absent; an empty value is
-# passed through to facets-resolver either way, which treats empty as "skip
-# the per-Application lookup, use the FACETS_PROJECT/FACETS_ENVIRONMENT
-# fallback".
+# passed through to facets-resolver either way, which treats a missing flag
+# as a hard error whenever the rendered stream has any ${facets:...} refs —
+# per-Application annotations are the only coordinate source, with no
+# fallback.
 subcommand=""
 resolve_namespace=""
 resolve_name_template=""

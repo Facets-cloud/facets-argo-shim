@@ -44,36 +44,37 @@ manifest stream regardless of how the chart produced them.
 ## Coordinate resolution
 
 Every render needs a Facets project + environment to resolve refs against.
-Resolved in order, per rendered stream:
+**Per-Application annotations are the only source — there is no
+repo-server-wide fallback of any kind.** A live, lazy Kubernetes LIST — not
+a shared file, not a separate daemon: the shim forwards the `--namespace`
+and `--name-template` values it extracts from real helm's own argv to
+`facets-resolver`. When the rendered stream contains any `${facets:...}`
+ref, both flags are required; facets-resolver then builds an in-cluster kube
+client (only at this point — never on a render with no refs at all) and
+lists `Application` CRs in `FACETS_ARGOCD_NAMESPACE` (default `argocd`),
+looking for exactly one whose effective destination namespace + release name
+match. Release name precedence: `spec.source.helm.releaseName`
+(single-source) → first non-empty `spec.sources[].helm.releaseName`
+(multi-source) → `metadata.name`. The matched Application must carry both
+`facets.cloud/project` and `facets.cloud/environment` annotations.
 
-1. **Per-Application**, via a live, lazy Kubernetes LIST — not a shared
-   file, not a separate daemon. The shim forwards the `--namespace` and
-   `--name-template` values it extracts from real helm's own argv to
-   `facets-resolver`. If both are non-empty, facets-resolver builds an
-   in-cluster kube client (only at this point — never on a render with no
-   `${facets:...}` refs at all) and lists `Application` CRs in
-   `FACETS_ARGOCD_NAMESPACE` (default `argocd`), looking for exactly one
-   whose effective destination namespace + release name match. Release name
-   precedence: `spec.source.helm.releaseName` (single-source) →  first
-   non-empty `spec.sources[].helm.releaseName` (multi-source) →
-   `metadata.name`. The matched Application must carry both
-   `facets.cloud/project` and `facets.cloud/environment` annotations.
-2. **Repo-server-wide fallback**: `FACETS_PROJECT`/`FACETS_ENVIRONMENT`,
-   set once on the `argocd-repo-server` Deployment — one repo-server mapped
-   to one Facets project+environment for every Application it renders that
-   isn't (or can't be) resolved per-Application.
+Every failure mode is a hard, fail-closed error — nothing partially
+resolved, and nothing resolved against a guessed identity, ever reaches
+stdout:
 
-A per-Application lookup that runs but fails outright — a Kubernetes API
-error, or an **ambiguous** match (more than one Application sharing the same
-destination namespace + release name) — is a hard, fail-closed error: it
-never silently falls through to the env-var fallback, since resolving
-against the wrong environment would be worse than failing loudly. Only a
-*clean* non-match (zero matching Applications, or a match lacking one or
-both annotations) falls through to the env-var fallback.
+- either `--namespace`/`--name-template` is empty (refs are present, so
+  there's no Application to identify);
+- the Kubernetes LIST call itself errors;
+- zero Applications match the destination namespace + release name;
+- the single match is missing `facets.cloud/project`,
+  `facets.cloud/environment`, or both (the error names the Application and
+  exactly which key(s) are missing);
+- more than one Application matches (**ambiguous** — the error names every
+  matching Application).
 
 If a rendered stream has zero `${facets:...}` refs, none of the above runs
-at all — no kube client, no CP call, no env var read. The stream is only
-passed through the `$$`-unescape step.
+at all — no kube client, no CP call, no flag is even read. The stream is
+only passed through the `$$`-unescape step.
 
 ## Install footprint
 
@@ -111,14 +112,15 @@ passed through the `$$`-unescape step.
   `/custom-tools` first on `PATH` inside `argocd-repo-server` so `helm`
   resolves to the shim, not the real binary.
 - `envFrom` (or explicit `env`) on `argocd-repo-server` providing
-  `FACETS_CP_URL`, `FACETS_CP_USERNAME`, `FACETS_CP_TOKEN`, and
-  `FACETS_PROJECT`/`FACETS_ENVIRONMENT` (repo-server-wide fallback
-  coordinates).
-- Optionally, for per-Application coordinates: RBAC (a Role/RoleBinding or
+  `FACETS_CP_URL`, `FACETS_CP_USERNAME`, `FACETS_CP_TOKEN`.
+- **Required, not optional**: RBAC (a Role/RoleBinding or
   ClusterRole/ClusterRoleBinding) granting `argocd-repo-server`'s
   ServiceAccount `list` on `applications.argoproj.io` in the Argo CD
-  namespace, and `FACETS_ARGOCD_NAMESPACE` set if it isn't `argocd`. Without
-  this, every render falls back straight to (2).
+  namespace, plus `automountServiceAccountToken: true` on the repo-server
+  pod spec (upstream installs often set this `false`). There is no fallback
+  coordinate source — any Application whose rendered manifests contain
+  `${facets:...}` refs fails its render without this RBAC. Set
+  `FACETS_ARGOCD_NAMESPACE` if Argo CD's own namespace isn't `argocd`.
 
 `REAL_HELM` and `FACETS_RESOLVER_BIN` are overridable via env on the
 `argocd-repo-server` container (defaults `/custom-tools/helm-real` and
@@ -135,7 +137,7 @@ the second copies this image's artifacts, and a `subPath` mount shadows
 
 ```yaml
 repoServer:
-  automountServiceAccountToken: true   # needed for per-App annotations only
+  automountServiceAccountToken: true   # required: per-App annotations are the only coordinate source
   initContainers:
     - name: copy-helm-real
       image: quay.io/argoproj/argocd:v3.3.5        # match your Argo version
@@ -164,9 +166,7 @@ extraObjects:
       FACETS_CP_URL: https://<org>.console.facets.cloud
       FACETS_CP_USERNAME: <user>
       FACETS_CP_TOKEN: <token>
-      FACETS_PROJECT: <default-project>        # optional fallback
-      FACETS_ENVIRONMENT: <default-environment>
-  - apiVersion: rbac.authorization.k8s.io/v1   # per-App annotations only
+  - apiVersion: rbac.authorization.k8s.io/v1   # required: per-App annotations are the only coordinate source
     kind: Role
     metadata: {name: facets-shim-app-reader, namespace: argocd}
     rules:
@@ -185,15 +185,13 @@ Note: on the argo-helm chart the repo-server ServiceAccount is usually named
 ## Install — kubectl (existing installs)
 
 ```bash
-# 1. credentials (+ optional fallback coordinates)
+# 1. credentials
 kubectl -n argocd create secret generic facets-cp-credentials \
   --from-literal=FACETS_CP_URL=https://<org>.console.facets.cloud \
   --from-literal=FACETS_CP_USERNAME=<user> \
-  --from-literal=FACETS_CP_TOKEN=<token> \
-  --from-literal=FACETS_PROJECT=<default-project> \
-  --from-literal=FACETS_ENVIRONMENT=<default-environment>
+  --from-literal=FACETS_CP_TOKEN=<token>
 
-# 2. RBAC (per-App annotations only)
+# 2. RBAC (required: per-App annotations are the only coordinate source)
 kubectl -n argocd create role facets-shim-app-reader \
   --verb=get,list --resource=applications.argoproj.io
 kubectl -n argocd create rolebinding facets-shim-app-reader \
@@ -245,11 +243,13 @@ no fields to any Application.
 - Per-Application coordinate resolution requires the shim to see
   `--namespace`/`--name-template` on helm's own argv, which is populated by
   Argo CD's builtin Helm source invocation — not guaranteed by every
-  possible repo-server configuration or Helm version.
-- A single repo-server pod resolving refs for many Applications across
-  different Facets projects/environments depends entirely on accurate
-  per-Application annotations; a misconfigured or missing annotation falls
-  back to the repo-server-wide default, which may be wrong for that
-  Application.
+  possible repo-server configuration or Helm version. There is no fallback:
+  if either flag is missing, any render whose manifests contain
+  `${facets:...}` refs hard-fails.
+- Per-Application annotations are the only coordinate source — there is no
+  repo-server-wide default. A missing or misconfigured
+  `facets.cloud/project`/`facets.cloud/environment` annotation on the
+  matched Application fails that render loudly rather than resolving
+  against a guessed identity.
 - No CMP mode, no kustomize support, no plain-directory support — helm-only,
   by design.

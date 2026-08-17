@@ -18,18 +18,12 @@ const refStream = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: demo\ndat
 
 // --- Facets CP stub (shared by all tests that need a real resolve) ---
 
-// stubCP serves the Facets CP only. Two distinct project/environment pairs
-// are wired up so a test can prove WHICH set of coordinates a run actually
-// queried with (env-var fallback vs. a per-Application match), not just
-// that resolution succeeded.
+// stubCP serves the Facets CP for the app-project/app-environment
+// coordinates a matched, annotated Application resolves to.
 func stubCP(t *testing.T) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.URL.Path == "/cc-ui/v1/stacks/env-project/clusters":
-			json.NewEncoder(w).Encode([]map[string]string{{"id": "env-1", "name": "env-environment"}})
-		case r.URL.Path == "/cc-ui/v1/clusters/env-1/resourceType/sqs/resourceName/orders/resource-out-properties":
-			json.NewEncoder(w).Encode(map[string]any{"attributes": map[string]any{"queue_url": "https://sqs.example/from-env"}})
 		case r.URL.Path == "/cc-ui/v1/stacks/app-project/clusters":
 			json.NewEncoder(w).Encode([]map[string]string{{"id": "env-2", "name": "app-environment"}})
 		case r.URL.Path == "/cc-ui/v1/clusters/env-2/resourceType/sqs/resourceName/orders/resource-out-properties":
@@ -41,8 +35,6 @@ func stubCP(t *testing.T) *httptest.Server {
 }
 
 func setEnv(t *testing.T, cpURL string) {
-	t.Setenv("FACETS_PROJECT", "env-project")
-	t.Setenv("FACETS_ENVIRONMENT", "env-environment")
 	t.Setenv("FACETS_CP_URL", cpURL)
 	t.Setenv("FACETS_CP_USERNAME", "u")
 	t.Setenv("FACETS_CP_TOKEN", "t")
@@ -69,7 +61,7 @@ func stubKube(t *testing.T, items []map[string]any) *httptest.Server {
 }
 
 // stubKubeError serves a 500 for the LIST endpoint, to exercise the
-// hard-error (not fallback) path.
+// hard-error path.
 func stubKubeError(t *testing.T) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -104,36 +96,12 @@ func explodingConfigProvider() (ConfigProvider, *bool) {
 	}, &called
 }
 
-// --- Happy path: env-var fallback (no flags) ---
+// --- Per-app happy path: a single matching, annotated Application ---
 
-func TestRunResolvesRefsFromEnv(t *testing.T) {
-	cp := stubCP(t)
-	defer cp.Close()
-	setEnv(t, cp.URL)
-	provider, called := explodingConfigProvider() // no flags -> per-app lookup never attempted
-
-	var out bytes.Buffer
-	if err := run(strings.NewReader(refStream), &out, "", "", provider); err != nil {
-		t.Fatal(err)
-	}
-	if *called {
-		t.Fatal("ConfigProvider was invoked despite no --namespace/--name-template flags")
-	}
-	s := out.String()
-	if !strings.Contains(s, "https://sqs.example/from-env") {
-		t.Fatalf("ref not resolved via env fallback:\n%s", s)
-	}
-	if strings.Contains(s, "${facets:") {
-		t.Fatalf("placeholder leaked into output:\n%s", s)
-	}
-}
-
-// --- Per-app happy path: a single matching, annotated Application wins over env ---
-
-func TestRunPerAppCoordinatesWinOverEnv(t *testing.T) {
+func TestRunPerAppAnnotatedMatchHappyPath(t *testing.T) {
 	cpSrv := stubCP(t)
 	defer cpSrv.Close()
-	setEnv(t, cpSrv.URL) // env-project/env-environment — must NOT be used
+	setEnv(t, cpSrv.URL)
 	kube := stubKube(t, []map[string]any{
 		appObj("my-app", "my-ns", map[string]any{
 			"facets.cloud/project": "app-project", "facets.cloud/environment": "app-environment",
@@ -149,9 +117,6 @@ func TestRunPerAppCoordinatesWinOverEnv(t *testing.T) {
 	s := out.String()
 	if !strings.Contains(s, "https://sqs.example/from-app") {
 		t.Fatalf("expected the matched Application's coordinates (app-project/app-environment) to be used, got:\n%s", s)
-	}
-	if strings.Contains(s, "from-env") {
-		t.Fatalf("env-var coordinates were used instead of the per-Application match:\n%s", s)
 	}
 }
 
@@ -179,9 +144,9 @@ func TestRunPerAppMatchViaCustomReleaseName(t *testing.T) {
 	}
 }
 
-// --- Matched Application without both annotations falls back to env ---
+// --- Matched Application missing both annotations: hard error naming the app and the missing keys ---
 
-func TestRunPerAppMatchWithoutAnnotationsFallsBackToEnv(t *testing.T) {
+func TestRunPerAppMatchMissingAnnotationsHardError(t *testing.T) {
 	kube := stubKube(t, []map[string]any{
 		appObj("my-app", "my-ns", map[string]any{}, ""), // matches ns+name, but no annotations at all
 	})
@@ -190,19 +155,45 @@ func TestRunPerAppMatchWithoutAnnotationsFallsBackToEnv(t *testing.T) {
 	defer cpSrv.Close()
 	setEnv(t, cpSrv.URL)
 
-	var out bytes.Buffer
-	err := run(strings.NewReader(refStream), &out, "my-ns", "my-app", staticConfig(&rest.Config{Host: kube.URL}))
-	if err != nil {
-		t.Fatal(err)
+	err := run(strings.NewReader(refStream), &bytes.Buffer{}, "my-ns", "my-app", staticConfig(&rest.Config{Host: kube.URL}))
+	if err == nil {
+		t.Fatal("expected a hard error for a match missing both annotations")
 	}
-	if !strings.Contains(out.String(), "https://sqs.example/from-env") {
-		t.Fatalf("expected env fallback for an unannotated match, got:\n%s", out.String())
+	for _, want := range []string{"argocd/my-app", annotationProject, annotationEnvironment} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q missing %q", err, want)
+		}
 	}
 }
 
-// --- Zero matches falls back to env ---
+// --- Matched Application missing only ONE annotation: error names only that key ---
 
-func TestRunPerAppZeroMatchesFallsBackToEnv(t *testing.T) {
+func TestRunPerAppMatchMissingOneAnnotationNamesOnlyThatOne(t *testing.T) {
+	kube := stubKube(t, []map[string]any{
+		appObj("my-app", "my-ns", map[string]any{
+			"facets.cloud/project": "app-project", // environment annotation absent
+		}, ""),
+	})
+	defer kube.Close()
+	cpSrv := stubCP(t)
+	defer cpSrv.Close()
+	setEnv(t, cpSrv.URL)
+
+	err := run(strings.NewReader(refStream), &bytes.Buffer{}, "my-ns", "my-app", staticConfig(&rest.Config{Host: kube.URL}))
+	if err == nil {
+		t.Fatal("expected a hard error for a match missing one annotation")
+	}
+	if !strings.Contains(err.Error(), annotationEnvironment) {
+		t.Fatalf("error %q missing %q", err, annotationEnvironment)
+	}
+	if strings.Contains(err.Error(), "missing annotation(s): "+annotationProject) {
+		t.Fatalf("error incorrectly also names the present annotation %q: %v", annotationProject, err)
+	}
+}
+
+// --- Zero matches: hard error ---
+
+func TestRunPerAppZeroMatchesHardError(t *testing.T) {
 	kube := stubKube(t, []map[string]any{
 		appObj("other-app", "other-ns", map[string]any{
 			"facets.cloud/project": "app-project", "facets.cloud/environment": "app-environment",
@@ -213,17 +204,18 @@ func TestRunPerAppZeroMatchesFallsBackToEnv(t *testing.T) {
 	defer cpSrv.Close()
 	setEnv(t, cpSrv.URL)
 
-	var out bytes.Buffer
-	err := run(strings.NewReader(refStream), &out, "my-ns", "my-app", staticConfig(&rest.Config{Host: kube.URL}))
-	if err != nil {
-		t.Fatal(err)
+	err := run(strings.NewReader(refStream), &bytes.Buffer{}, "my-ns", "my-app", staticConfig(&rest.Config{Host: kube.URL}))
+	if err == nil {
+		t.Fatal("expected a hard error when zero Applications match")
 	}
-	if !strings.Contains(out.String(), "https://sqs.example/from-env") {
-		t.Fatalf("expected env fallback when zero Applications match, got:\n%s", out.String())
+	for _, want := range []string{"my-ns", "my-app", "argocd"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q missing %q", err, want)
+		}
 	}
 }
 
-// --- Two matches: hard, named ambiguity error — even with valid env fallback available ---
+// --- Two matches: hard, named ambiguity error ---
 
 func TestRunPerAppAmbiguousMatchesHardError(t *testing.T) {
 	kube := stubKube(t, []map[string]any{
@@ -237,7 +229,7 @@ func TestRunPerAppAmbiguousMatchesHardError(t *testing.T) {
 	defer kube.Close()
 	cpSrv := stubCP(t)
 	defer cpSrv.Close()
-	setEnv(t, cpSrv.URL) // valid env fallback available — must NOT be used
+	setEnv(t, cpSrv.URL)
 
 	err := run(strings.NewReader(refStream), &bytes.Buffer{}, "my-ns", "my-app", staticConfig(&rest.Config{Host: kube.URL}))
 	if err == nil {
@@ -253,37 +245,18 @@ func TestRunPerAppAmbiguousMatchesHardError(t *testing.T) {
 	}
 }
 
-// --- Kubernetes API error: hard error, never a silent fallback to env ---
+// --- Kubernetes API error: hard error ---
 
 func TestRunPerAppListAPIErrorHardError(t *testing.T) {
 	kube := stubKubeError(t)
 	defer kube.Close()
 	cpSrv := stubCP(t)
 	defer cpSrv.Close()
-	setEnv(t, cpSrv.URL) // valid env fallback available — must NOT be used
+	setEnv(t, cpSrv.URL)
 
 	err := run(strings.NewReader(refStream), &bytes.Buffer{}, "my-ns", "my-app", staticConfig(&rest.Config{Host: kube.URL}))
 	if err == nil {
-		t.Fatal("expected a hard error from the failed LIST, not a silent env fallback")
-	}
-}
-
-// --- Neither per-app nor env: aggregated error naming both attempts ---
-
-func TestRunNeitherPerAppNorEnvAggregatedError(t *testing.T) {
-	t.Setenv("FACETS_PROJECT", "")
-	t.Setenv("FACETS_ENVIRONMENT", "")
-	kube := stubKube(t, nil) // zero Applications at all
-	defer kube.Close()
-
-	err := run(strings.NewReader(refStream), &bytes.Buffer{}, "my-ns", "my-app", staticConfig(&rest.Config{Host: kube.URL}))
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	for _, want := range []string{"my-ns", "my-app", "FACETS_PROJECT", "FACETS_ENVIRONMENT"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("error %q missing %q", err, want)
-		}
+		t.Fatal("expected a hard error from the failed LIST")
 	}
 }
 
@@ -309,11 +282,9 @@ func TestRunZeroRefsPassesThroughUnescaped(t *testing.T) {
 	}
 }
 
-// --- Existing env-var aggregation tests (no flags -> per-app lookup skipped) ---
+// --- Empty flags + refs present: hard error, no kube client ever attempted, aggregated with missing CP config ---
 
-func TestRunMissingEnvVarsFailsClosed(t *testing.T) {
-	t.Setenv("FACETS_PROJECT", "")
-	t.Setenv("FACETS_ENVIRONMENT", "")
+func TestRunEmptyFlagsFailsClosed(t *testing.T) {
 	t.Setenv("FACETS_CP_URL", "")
 	t.Setenv("FACETS_CP_USERNAME", "")
 	t.Setenv("FACETS_CP_TOKEN", "")
@@ -323,29 +294,13 @@ func TestRunMissingEnvVarsFailsClosed(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	for _, want := range []string{"FACETS_PROJECT", "FACETS_ENVIRONMENT", "FACETS_CP_URL"} {
+	if *called {
+		t.Fatal("ConfigProvider was invoked despite empty --namespace/--name-template flags")
+	}
+	for _, want := range []string{"--namespace", "--name-template", "FACETS_CP_URL"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error %q missing %q", err, want)
 		}
-	}
-	if *called {
-		t.Fatal("ConfigProvider was invoked despite no --namespace/--name-template flags")
-	}
-}
-
-func TestRunMissingProjectOnlyFailsClosed(t *testing.T) {
-	cpSrv := stubCP(t)
-	defer cpSrv.Close()
-	setEnv(t, cpSrv.URL)
-	t.Setenv("FACETS_PROJECT", "")
-	provider, _ := explodingConfigProvider()
-
-	err := run(strings.NewReader(refStream), &bytes.Buffer{}, "", "", provider)
-	if err == nil || !strings.Contains(err.Error(), "FACETS_PROJECT") {
-		t.Fatalf("err = %v", err)
-	}
-	if strings.Contains(err.Error(), "FACETS_ENVIRONMENT is not set") {
-		t.Fatalf("err incorrectly also complains about FACETS_ENVIRONMENT: %v", err)
 	}
 }
 
