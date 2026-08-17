@@ -1,0 +1,273 @@
+// resolver_test.go
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"reflect"
+	"strings"
+	"testing"
+
+	"gopkg.in/yaml.v3"
+)
+
+func TestFindParsesRef(t *testing.T) {
+	got, err := Find("url: ${facets:sqs.orders.out.attributes.queue_url}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Ref{{
+		Raw:          "${facets:sqs.orders.out.attributes.queue_url}",
+		ResourceType: "sqs",
+		ResourceName: "orders",
+		Path:         []string{"attributes", "queue_url"},
+	}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %+v want %+v", got, want)
+	}
+}
+
+func TestFindMultipleAndInterfaces(t *testing.T) {
+	got, err := Find("${facets:postgres.main.out.interfaces.reader.connection_string} and ${facets:redis.cache.out.attributes.host}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Path[0] != "interfaces" || got[1].ResourceType != "redis" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestFindSkipsEscaped(t *testing.T) {
+	got, err := Find("literal: $${facets:sqs.q.out.attributes.url}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("escaped ref matched: %+v", got)
+	}
+}
+
+func TestFindRejectsMalformed(t *testing.T) {
+	for _, s := range []string{
+		"${facets:sqs.orders}",                           // no out segment
+		"${facets:sqs.orders.attributes.url}",            // missing out
+		"${facets:sqs.orders.out}",                       // empty path
+		"${facets:}",                                     // empty
+		"${facets:.orders.out.attributes.x}",             // empty type
+		"${facets:sqs..out.attributes.x}",                // empty name
+		"${facets:sqs.orders.out.attributes.}",           // trailing dot (empty path segment)
+		"${facets:sqs.orders.out.attributes..queue_url}", // interior empty segment
+	} {
+		if _, err := Find(s); err == nil {
+			t.Fatalf("expected error for %q", s)
+		}
+	}
+}
+
+func TestUnescape(t *testing.T) {
+	if got := Unescape("a $${facets:x.y.out.z} b"); got != "a ${facets:x.y.out.z} b" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func lookup(t *testing.T) LookupFunc {
+	vals := map[string]any{
+		"sqs.orders.out.attributes.queue_url": "https://sqs.example/orders",
+		"service.api.out.attributes.replicas": float64(3),
+		"feature.flags.out.attributes.on":     true,
+		"postgres.main.out.attributes.conn":   map[string]any{"host": "db.example", "port": float64(5432)},
+	}
+	return func(r Ref) (any, error) {
+		key := r.ResourceType + "." + r.ResourceName + ".out." + strings.Join(r.Path, ".")
+		v, ok := vals[key]
+		if !ok {
+			return nil, fmt.Errorf("no output at %s", key)
+		}
+		return v, nil
+	}
+}
+
+// resolveStreamTo resolves a single-document stream through ResolveStream
+// and decodes it back into a map, for tests that don't care about
+// multi-document behavior (that's covered separately by the
+// TestResolveStream* multi-doc tests below).
+func resolveStreamTo(t *testing.T, in string) map[string]any {
+	t.Helper()
+	out, err := ResolveStream([]byte(in), lookup(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := yaml.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+// decodeAllDocs decodes every document in a stream into plain Go values,
+// re-parsing it the way a consumer downstream of ResolveStream would.
+func decodeAllDocs(t *testing.T, stream []byte) []any {
+	t.Helper()
+	dec := yaml.NewDecoder(bytes.NewReader(stream))
+	var docs []any
+	for {
+		var v any
+		err := dec.Decode(&v)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("stream does not re-parse doc-by-doc: %v\n%s", err, stream)
+		}
+		docs = append(docs, v)
+	}
+	return docs
+}
+
+func TestResolveStreamMultiDoc(t *testing.T) {
+	in := "a: ${facets:sqs.orders.out.attributes.queue_url}\n---\nb: ${facets:service.api.out.attributes.replicas}\n"
+	out, err := ResolveStream([]byte(in), lookup(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	docs := decodeAllDocs(t, out)
+	if len(docs) != 2 {
+		t.Fatalf("got %d docs, want 2:\n%s", len(docs), out)
+	}
+	doc0 := docs[0].(map[string]any)
+	if doc0["a"] != "https://sqs.example/orders" {
+		t.Fatalf("doc0 = %#v", doc0)
+	}
+	doc1 := docs[1].(map[string]any)
+	if doc1["b"] != 3 && doc1["b"] != float64(3) {
+		t.Fatalf("doc1 = %#v, want order preserved (doc1.b resolved)", doc1)
+	}
+}
+
+func TestResolveStreamAggregatesErrorsAcrossDocs(t *testing.T) {
+	in := "a: ${facets:nope.a.out.attributes.x}\n---\nb: ${facets:nope.b.out.attributes.y}\n"
+	_, err := ResolveStream([]byte(in), lookup(t))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	for _, want := range []string{"nope.a", "nope.b"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q missing %q", err, want)
+		}
+	}
+}
+
+func TestResolveStreamEscapeOnly(t *testing.T) {
+	in := "raw: $${facets:sqs.orders.out.attributes.queue_url}\n---\nother: $${facets:a.b.out.c}\n"
+	out, err := ResolveStream([]byte(in), lookup(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	docs := decodeAllDocs(t, out)
+	if len(docs) != 2 {
+		t.Fatalf("got %d docs, want 2:\n%s", len(docs), out)
+	}
+	if docs[0].(map[string]any)["raw"] != "${facets:sqs.orders.out.attributes.queue_url}" {
+		t.Fatalf("doc0 = %#v", docs[0])
+	}
+	if docs[1].(map[string]any)["other"] != "${facets:a.b.out.c}" {
+		t.Fatalf("doc1 = %#v", docs[1])
+	}
+	if strings.Contains(string(out), "$${facets:") {
+		t.Fatalf("escaped ref leaked verbatim:\n%s", out)
+	}
+}
+
+func TestResolveStreamNullAndEmptyDocsPassThrough(t *testing.T) {
+	in := "a: 1\n---\n---\nb: 2\n"
+	out, err := ResolveStream([]byte(in), lookup(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	docs := decodeAllDocs(t, out)
+	if len(docs) != 3 {
+		t.Fatalf("got %d docs, want 3 (incl. 1 null passthrough doc):\n%s", len(docs), out)
+	}
+	if docs[0].(map[string]any)["a"] != 1 {
+		t.Fatalf("doc0 = %#v", docs[0])
+	}
+	if docs[1] != nil {
+		t.Fatalf("doc1 = %#v, want nil (empty doc passthrough)", docs[1])
+	}
+	if docs[2].(map[string]any)["b"] != 2 {
+		t.Fatalf("doc2 = %#v", docs[2])
+	}
+}
+
+func TestWholeRefKeepsType(t *testing.T) {
+	m := resolveStreamTo(t, "replicas: ${facets:service.api.out.attributes.replicas}\nflag: ${facets:feature.flags.out.attributes.on}\n")
+	if m["replicas"] != 3 && m["replicas"] != float64(3) {
+		t.Fatalf("replicas = %#v, want 3", m["replicas"])
+	}
+	if m["flag"] != true {
+		t.Fatalf("flag = %#v, want true", m["flag"])
+	}
+}
+
+func TestWholeRefObject(t *testing.T) {
+	m := resolveStreamTo(t, "db: ${facets:postgres.main.out.attributes.conn}\n")
+	db := m["db"].(map[string]any)
+	if db["host"] != "db.example" {
+		t.Fatalf("db = %#v", db)
+	}
+}
+
+func TestEmbeddedRefStringifies(t *testing.T) {
+	m := resolveStreamTo(t, "url: prefix-${facets:sqs.orders.out.attributes.queue_url}-suffix\nn: \"r=${facets:service.api.out.attributes.replicas}\"\n")
+	if m["url"] != "prefix-https://sqs.example/orders-suffix" {
+		t.Fatalf("url = %#v", m["url"])
+	}
+	if m["n"] != "r=3" {
+		t.Fatalf("n = %#v", m["n"])
+	}
+}
+
+func TestEmbeddedObjectIsError(t *testing.T) {
+	_, err := ResolveStream([]byte("x: a-${facets:postgres.main.out.attributes.conn}\n"), lookup(t))
+	if err == nil || !strings.Contains(err.Error(), "non-scalar") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// Aggregation WITHIN a single document (two bad refs, two different keys, one
+// document) — distinct from TestResolveStreamAggregatesErrorsAcrossDocs above,
+// which aggregates across separate "---"-separated documents.
+func TestErrorsAggregateWithinDocument(t *testing.T) {
+	_, err := ResolveStream([]byte("a: ${facets:nope.a.out.attributes.x}\nb: ${facets:nope.b.out.attributes.y}\n"), lookup(t))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	for _, want := range []string{"nope.a", "nope.b"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q missing %q", err, want)
+		}
+	}
+}
+
+func TestNestedStructuresWalked(t *testing.T) {
+	m := resolveStreamTo(t, "outer:\n  list:\n  - ${facets:sqs.orders.out.attributes.queue_url}\n")
+	list := m["outer"].(map[string]any)["list"].([]any)
+	if list[0] != "https://sqs.example/orders" {
+		t.Fatalf("list = %#v", list)
+	}
+}
+
+func TestWholeRefPreservesAnchor(t *testing.T) {
+	out, err := ResolveStream([]byte("anchor: &a ${facets:sqs.orders.out.attributes.queue_url}\nalias: *a\n"), lookup(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := yaml.Unmarshal(out, &m); err != nil {
+		t.Fatalf("resolved document does not re-parse: %v\n%s", err, out)
+	}
+	if m["anchor"] != "https://sqs.example/orders" || m["alias"] != "https://sqs.example/orders" {
+		t.Fatalf("m = %#v", m)
+	}
+}
