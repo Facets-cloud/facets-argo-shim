@@ -49,18 +49,45 @@ func TestFindSkipsEscaped(t *testing.T) {
 }
 
 func TestFindRejectsMalformed(t *testing.T) {
+	// These all match refPattern's grammar (dot-separated
+	// [A-Za-z0-9_-]+ segments) but fail Find's own arity/"out"-position
+	// checks — still caught directly, with an error, inside Find itself.
 	for _, s := range []string{
-		"${facets:sqs.orders}",                           // no out segment
-		"${facets:sqs.orders.attributes.url}",            // missing out
-		"${facets:sqs.orders.out}",                       // empty path
-		"${facets:}",                                     // empty
-		"${facets:.orders.out.attributes.x}",             // empty type
-		"${facets:sqs..out.attributes.x}",                // empty name
-		"${facets:sqs.orders.out.attributes.}",           // trailing dot (empty path segment)
-		"${facets:sqs.orders.out.attributes..queue_url}", // interior empty segment
+		"${facets:sqs.orders}",                // no out segment
+		"${facets:sqs.orders.attributes.url}", // missing out
+		"${facets:sqs.orders.out}",            // empty path
 	} {
 		if _, err := Find(s); err == nil {
 			t.Fatalf("expected error for %q", s)
+		}
+	}
+}
+
+// TestFindSkipsMalformedGrammarWithoutMatching documents the flip side of
+// refPattern's stricter grammar: these never match the regex at all (an
+// empty segment from a leading/interior/trailing dot, or fully empty
+// content), so Find reports zero refs and no error — it's not that Find
+// silently approves them, it simply never sees them as a ref candidate in
+// the first place. They're caught downstream instead, by the
+// findUnresolvedRef fail-closed net exercised in
+// TestResolveStreamUnresolvedGarbageHardError and
+// TestRunZeroRefsGarbageHardError.
+func TestFindSkipsMalformedGrammarWithoutMatching(t *testing.T) {
+	for _, s := range []string{
+		"${facets:}",                                     // empty
+		"${facets:.orders.out.attributes.x}",             // empty type (leading dot)
+		"${facets:sqs..out.attributes.x}",                // empty name (interior dot)
+		"${facets:sqs.orders.out.attributes.}",           // trailing dot (empty path segment)
+		"${facets:sqs.orders.out.attributes..queue_url}", // interior empty segment
+		"${facets:sqs.orders!.out.attributes.x}",         // illegal character
+		"${facets:sqs.orders.out.attributes.queue_url",   // unterminated (no closing brace)
+	} {
+		got, err := Find(s)
+		if err != nil {
+			t.Fatalf("%q: unexpected error: %v", s, err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("%q: got %+v, want zero refs (regex shouldn't match)", s, got)
 		}
 	}
 }
@@ -255,6 +282,63 @@ func TestNestedStructuresWalked(t *testing.T) {
 	list := m["outer"].(map[string]any)["list"].([]any)
 	if list[0] != "https://sqs.example/orders" {
 		t.Fatalf("list = %#v", list)
+	}
+}
+
+// TestResolveStreamUnresolvedGarbageHardError proves the findUnresolvedRef
+// fail-closed net: input that refPattern's stricter grammar no longer
+// matches as a ref (see TestFindSkipsMalformedGrammarWithoutMatching) must
+// still hard-fail the render rather than leaking the literal, un-resolved
+// "${facets:" text into the output.
+func TestResolveStreamUnresolvedGarbageHardError(t *testing.T) {
+	cases := map[string]string{
+		"trailing dot":   "bad: ${facets:sqs.orders.out.attributes.}\n",
+		"interior empty": "bad: ${facets:sqs.orders.out.attributes..queue_url}\n",
+		"illegal char":   "bad: ${facets:sqs.orders!.out.attributes.x}\n",
+		"unterminated":   "bad: ${facets:sqs.orders.out.attributes.queue_url\n",
+		"empty":          "bad: ${facets:}\n",
+	}
+	for name, in := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := ResolveStream([]byte(in), lookup(t))
+			if err == nil {
+				t.Fatalf("expected a hard error for %s", name)
+			}
+			if !strings.Contains(err.Error(), "unresolved or malformed facets reference") {
+				t.Fatalf("%s: err = %v", name, err)
+			}
+		})
+	}
+}
+
+// TestResolveStreamUnresolvedGarbageAlongsideValidRef proves the guard also
+// fires when garbage shares a document with an otherwise-valid, successfully
+// resolved ref (i.e. it isn't just a whole-stream fallback check).
+func TestResolveStreamUnresolvedGarbageAlongsideValidRef(t *testing.T) {
+	in := "good: ${facets:sqs.orders.out.attributes.queue_url}\nbad: ${facets:sqs.orders!.out.attributes.x}\n"
+	_, err := ResolveStream([]byte(in), lookup(t))
+	if err == nil {
+		t.Fatal("expected a hard error")
+	}
+	if !strings.Contains(err.Error(), "unresolved or malformed facets reference") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// TestResolveStreamEscapedGarbageLookalikeIsNotFlagged proves the guard
+// doesn't false-positive on a legitimately $$-escaped ref, even though the
+// escaped and unresolved-garbage cases look identical AFTER Unescape runs —
+// the guard runs against the pre-Unescape text specifically to tell them
+// apart. Overlaps with TestResolveStreamEscapeOnly but asserts it from the
+// guard's specific point of view.
+func TestResolveStreamEscapedGarbageLookalikeIsNotFlagged(t *testing.T) {
+	in := "raw: $${facets:sqs.orders.out.attributes.queue_url}\n"
+	out, err := ResolveStream([]byte(in), lookup(t))
+	if err != nil {
+		t.Fatalf("escaped ref incorrectly flagged as unresolved garbage: %v", err)
+	}
+	if !strings.Contains(string(out), "${facets:sqs.orders.out.attributes.queue_url}") {
+		t.Fatalf("unescaped literal missing from output:\n%s", out)
 	}
 }
 

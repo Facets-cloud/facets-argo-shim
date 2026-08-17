@@ -304,8 +304,36 @@ func TestRunEmptyFlagsFailsClosed(t *testing.T) {
 	}
 }
 
+// TestRunZeroRefsGarbageHardError proves the findUnresolvedRef guard in
+// main.go's zero-refs passthrough path: refPattern's stricter grammar means
+// Find sees zero refs for this input (the "!" isn't a legal ref character),
+// so without the guard this would silently reach stdout verbatim instead of
+// failing closed like a well-formed-but-otherwise-invalid ref does.
+func TestRunZeroRefsGarbageHardError(t *testing.T) {
+	in := "data:\n  bad: ${facets:sqs.orders!.out.attributes.x}\n"
+	provider, called := explodingConfigProvider()
+
+	err := run(strings.NewReader(in), &bytes.Buffer{}, "my-ns", "my-app", provider)
+	if err == nil {
+		t.Fatal("expected a hard error, not a silent passthrough of the malformed ref")
+	}
+	if !strings.Contains(err.Error(), "unresolved or malformed facets reference") {
+		t.Fatalf("err = %v", err)
+	}
+	if *called {
+		t.Fatal("ConfigProvider was invoked despite the guard short-circuiting first")
+	}
+}
+
+// TestRunMalformedRefFailsClosed uses a ref that still matches refPattern's
+// grammar (valid characters, dot-separated) but fails Find's own arity/"out"
+// check — Find itself returns the error here, short-circuiting before
+// coordinate resolution is ever attempted. (A ref the stricter grammar
+// doesn't match at all — e.g. an illegal character or an unterminated
+// sequence — is a different code path: see TestRunZeroRefsGarbageHardError,
+// which exercises the post-resolution findUnresolvedRef guard instead.)
 func TestRunMalformedRefFailsClosed(t *testing.T) {
-	in := "data:\n  bad: ${facets:sqs.orders.out.attributes.}\n"
+	in := "data:\n  bad: ${facets:sqs.orders.out}\n" // empty path
 	provider, called := explodingConfigProvider()
 
 	err := run(strings.NewReader(in), &bytes.Buffer{}, "my-ns", "my-app", provider)

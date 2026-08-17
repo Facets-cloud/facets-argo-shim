@@ -76,6 +76,47 @@ If a rendered stream has zero `${facets:...}` refs, none of the above runs
 at all — no kube client, no CP call, no flag is even read. The stream is
 only passed through the `$$`-unescape step.
 
+## Security posture
+
+Per-Application coordinate resolution needs `argocd-repo-server`'s own
+ServiceAccount token, mounted in-cluster, to LIST `Application` CRs — that's
+a deliberate, scoped grant, worth stating plainly rather than leaving
+implicit.
+
+**The exact Role granted** (see the install recipes above for the full
+Role/RoleBinding): `list` only, on `applications.argoproj.io`, namespaced to
+Argo CD's own namespace (`argocd` by default, or `FACETS_ARGOCD_NAMESPACE`).
+No `get`, no `watch`, no `create`/`update`/`delete`, no other resource type,
+no other namespace, no cluster-wide grant.
+
+**Why the token is needed at all**: this is the only way to identify which
+Facets project/environment a given `helm template` render belongs to (see
+"Coordinate resolution" above) — the shim has no other channel into Argo
+CD's own state, and per-Application annotations are the only coordinate
+source (there is no env-var fallback to fall back to instead).
+
+**Residual risk, stated plainly**: `argocd-repo-server` already has broad
+reach by design (it clones and renders every configured Git repo). This
+grant adds read-only visibility into one more thing: every `Application`
+object's spec and annotations (names, destinations, source repos/paths,
+Facets project/environment labels) in the Argo CD namespace — not their
+`Secret`s, not other namespaces, not write access to anything. If
+`argocd-repo-server` is compromised, that's what this specific grant adds to
+the blast radius. Upstream Argo CD manifests ship `repo-server` with
+`automountServiceAccountToken: false` deliberately, precisely because it
+normally needs no Kubernetes API access at all — enabling it here is a
+conscious trade, not an oversight, and is why this section exists.
+
+**Degraded mode without the token**: skip the RBAC and
+`automountServiceAccountToken: true` entirely, and the shim still installs
+and runs — any render whose manifests contain zero `${facets:...}` refs is
+completely unaffected (see "Coordinate resolution": the kube client is never
+even built on that path). Only renders that DO contain refs fail closed,
+with an error explaining that per-Application coordinate resolution couldn't
+run. This is a legitimate way to stage a rollout: install the shim first,
+confirm it's a no-op for every existing Application, then grant the RBAC
+once you're ready for `${facets:...}` refs to actually resolve.
+
 ## Install footprint
 
 `argocd-repo-server` needs:
@@ -145,7 +186,7 @@ repoServer:
       volumeMounts:
         - {name: custom-tools, mountPath: /custom-tools}
     - name: copy-facets-tools
-      image: docker.io/facetscloud/facets-argo-shim:v0.9
+      image: docker.io/facetscloud/facets-argo-shim:v0.11
       command: [sh, -c, "cp /opt/facets/facets-resolver /custom-tools/ && cp /opt/facets/helm-shim.sh /custom-tools/helm-shim && chmod 755 /custom-tools/*"]
       volumeMounts:
         - {name: custom-tools, mountPath: /custom-tools}
@@ -170,7 +211,7 @@ extraObjects:
     kind: Role
     metadata: {name: facets-shim-app-reader, namespace: argocd}
     rules:
-      - {apiGroups: [argoproj.io], resources: [applications], verbs: [get, list]}
+      - {apiGroups: [argoproj.io], resources: [applications], verbs: [list]}
   - apiVersion: rbac.authorization.k8s.io/v1
     kind: RoleBinding
     metadata: {name: facets-shim-app-reader, namespace: argocd}
@@ -193,7 +234,7 @@ kubectl -n argocd create secret generic facets-cp-credentials \
 
 # 2. RBAC (required: per-App annotations are the only coordinate source)
 kubectl -n argocd create role facets-shim-app-reader \
-  --verb=get,list --resource=applications.argoproj.io
+  --verb=list --resource=applications.argoproj.io
 kubectl -n argocd create rolebinding facets-shim-app-reader \
   --role=facets-shim-app-reader --serviceaccount=argocd:argocd-repo-server
 
@@ -201,8 +242,15 @@ kubectl -n argocd create rolebinding facets-shim-app-reader \
 kubectl -n argocd patch deployment argocd-repo-server --patch-file shim-patch.yaml
 ```
 
-`shim-patch.yaml` (strategic merge; container name is `repo-server` on
-upstream manifests):
+`shim-patch.yaml` (strategic merge). **Pick your variant** — the repo-server
+container's name depends on how Argo CD was installed, and a strategic-merge
+patch only lands on a container name it matches exactly:
+
+- **Upstream raw manifests** (`kubectl apply -f install.yaml`, what this
+  recipe targets): container name `argocd-repo-server`, used below.
+- **argo-helm chart installs**: container name `repo-server` instead — use
+  the "Install — Helm chart" recipe above (it patches via chart values, not
+  this kubectl patch, so the name difference doesn't come up there).
 
 ```yaml
 spec:
@@ -216,12 +264,12 @@ spec:
           volumeMounts:
             - {name: custom-tools, mountPath: /custom-tools}
         - name: copy-facets-tools
-          image: docker.io/facetscloud/facets-argo-shim:v0.9
+          image: docker.io/facetscloud/facets-argo-shim:v0.11
           command: [sh, -c, "cp /opt/facets/facets-resolver /custom-tools/ && cp /opt/facets/helm-shim.sh /custom-tools/helm-shim && chmod 755 /custom-tools/*"]
           volumeMounts:
             - {name: custom-tools, mountPath: /custom-tools}
       containers:
-        - name: repo-server
+        - name: argocd-repo-server   # "repo-server" on argo-helm installs — see note above
           envFrom:
             - secretRef: {name: facets-cp-credentials}
           volumeMounts:
@@ -251,5 +299,16 @@ no fields to any Application.
   `facets.cloud/project`/`facets.cloud/environment` annotation on the
   matched Application fails that render loudly rather than resolving
   against a guessed identity.
+- An Application without `spec.destination.namespace` set can never be
+  matched (its effective destination namespace is empty, which never equals
+  the shim's real `--namespace` argument) — any render of it containing
+  `${facets:...}` refs fails closed with an error explaining the namespace +
+  release name it looked for.
+- Resolved values land in plaintext in the rendered manifests Argo CD
+  applies, diffs, and shows in its UI — the same as any other Helm value.
+  `${facets:...}` refs are for plain configuration, not secrets: route
+  anything secret-shaped (credentials, tokens, keys) through Kubernetes
+  `Secret` objects or an external secret manager instead, not through a ref
+  resolved into a `ConfigMap` or pod spec.
 - No CMP mode, no kustomize support, no plain-directory support — helm-only,
   by design.

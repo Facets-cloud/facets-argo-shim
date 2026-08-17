@@ -3,11 +3,14 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func newStub(t *testing.T, outputCalls *atomic.Int32) *httptest.Server {
@@ -141,6 +144,67 @@ func TestLookupMemoizesFailedFetch(t *testing.T) {
 	}
 }
 
+// TestLookupBigIntegerRoundTripsExactly proves cpclient.go's UseNumber()
+// decoding, threaded through resolver.go's scalarNodeForValue/embedded
+// json.Number handling, round-trips a large integer (18 digits — well past
+// float64's ~15-17 significant digit precision, where naive float64
+// decoding would silently corrupt it or render it in scientific notation)
+// exactly, both as a whole-scalar ref and embedded in a string. A float
+// value alongside it must still work correctly too.
+func TestLookupBigIntegerRoundTripsExactly(t *testing.T) {
+	const bigInt = "123456789012345678"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/cc-ui/v1/stacks/demo-project/clusters":
+			json.NewEncoder(w).Encode([]map[string]string{{"id": "env-dev-1", "name": "dev"}})
+		case r.URL.Path == "/cc-ui/v1/clusters/env-dev-1/resourceType/sqs/resourceName/orders/resource-out-properties":
+			fmt.Fprintf(w, `{"attributes":{"account_id":%s,"ratio":1.5}}`, bigInt)
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	c := NewCPClient(CPConfig{URL: srv.URL, Username: "rohit@facets.cloud", Token: "tok-123"})
+	look := c.Lookup("demo-project", "dev")
+
+	in := "whole: ${facets:sqs.orders.out.attributes.account_id}\n" +
+		"embedded: id-${facets:sqs.orders.out.attributes.account_id}\n" +
+		"ratioWhole: ${facets:sqs.orders.out.attributes.ratio}\n" +
+		"ratioEmbedded: r-${facets:sqs.orders.out.attributes.ratio}\n"
+	out, err := ResolveStream([]byte(in), look)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	if !strings.Contains(s, "whole: "+bigInt+"\n") {
+		t.Fatalf("whole-ref big integer not emitted exactly, got:\n%s", s)
+	}
+	if !strings.Contains(s, "embedded: id-"+bigInt+"\n") {
+		t.Fatalf("embedded big integer not emitted exactly, got:\n%s", s)
+	}
+
+	var m map[string]any
+	if err := yaml.Unmarshal(out, &m); err != nil {
+		t.Fatalf("resolved document does not re-parse: %v\n%s", err, out)
+	}
+	// The output re-parses as an actual integer (not a quoted string) with
+	// every digit intact — proves it's not float64-corrupted or quoted.
+	switch v := m["whole"].(type) {
+	case int, int64, uint64:
+		if fmt.Sprintf("%v", v) != bigInt {
+			t.Fatalf("whole = %v, want %s", v, bigInt)
+		}
+	default:
+		t.Fatalf("whole = %#v (%T), want an integer type", v, v)
+	}
+	if m["ratioWhole"] != 1.5 {
+		t.Fatalf("ratioWhole = %#v, want 1.5 (float values must still work)", m["ratioWhole"])
+	}
+	if m["ratioEmbedded"] != "r-1.5" {
+		t.Fatalf("ratioEmbedded = %#v, want %q", m["ratioEmbedded"], "r-1.5")
+	}
+}
+
 func TestConfigFromEnvListsAllMissing(t *testing.T) {
 	t.Setenv("FACETS_CP_URL", "")
 	t.Setenv("FACETS_CP_USERNAME", "")
@@ -153,5 +217,22 @@ func TestConfigFromEnvListsAllMissing(t *testing.T) {
 		if !strings.Contains(err.Error(), v) {
 			t.Fatalf("error %q missing %s", err, v)
 		}
+	}
+}
+
+// TestConfigFromEnvAllowsNonHTTPS proves a non-https FACETS_CP_URL is still
+// allowed (in-cluster stubs/sidecars over plain HTTP are a legitimate
+// setup) — warnIfNotHTTPS only ever writes to stderr, never returns an
+// error.
+func TestConfigFromEnvAllowsNonHTTPS(t *testing.T) {
+	t.Setenv("FACETS_CP_URL", "http://facets-cp.internal")
+	t.Setenv("FACETS_CP_USERNAME", "u")
+	t.Setenv("FACETS_CP_TOKEN", "t")
+	cfg, err := ConfigFromEnv()
+	if err != nil {
+		t.Fatalf("non-https FACETS_CP_URL must still be allowed: %v", err)
+	}
+	if cfg.URL != "http://facets-cp.internal" {
+		t.Fatalf("cfg.URL = %q", cfg.URL)
 	}
 }

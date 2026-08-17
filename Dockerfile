@@ -1,9 +1,18 @@
-FROM golang:1.25-alpine AS build
+# --platform=$BUILDPLATFORM: always run this stage natively on the build
+# host, even when building a linux/arm64 image on an amd64 runner (or vice
+# versa) via `docker buildx build --platform linux/amd64,linux/arm64`. Go
+# cross-compiles trivially via GOOS/GOARCH (set from buildx's own
+# auto-populated TARGETOS/TARGETARCH build args below), so the expensive
+# compile step never needs QEMU emulation — only the lightweight final stage
+# (apk add, chmod) does.
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
 WORKDIR /src
 COPY resolver/go.mod resolver/go.sum ./
 RUN go mod download
 COPY resolver/ .
-RUN CGO_ENABLED=0 go build -o /out/facets-resolver .
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o /out/facets-resolver .
 
 FROM alpine:3.20
 # ca-certificates: facets-resolver talks to the Facets control plane over

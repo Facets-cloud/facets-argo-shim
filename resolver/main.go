@@ -71,7 +71,17 @@ func run(stdin io.Reader, stdout io.Writer, namespace, nameTemplate string, getK
 		// ignored entirely on this path. Still unescape any $$-escaped
 		// literals — a safe no-op string replace when there's nothing to
 		// unescape.
-		_, err := stdout.Write([]byte(Unescape(string(input))))
+		//
+		// Guard first: refPattern's stricter grammar (see resolver.go) means
+		// an unterminated "${facets:" sequence, or one using characters
+		// outside type.name.out.path, no longer counts as a "found" ref at
+		// all — without this check it would silently reach stdout verbatim
+		// instead of failing closed like every other malformed ref does.
+		raw := string(input)
+		if snippet, bad := findUnresolvedRef(raw); bad {
+			return fmt.Errorf("unresolved or malformed facets reference remains: %q", snippet)
+		}
+		_, err := stdout.Write([]byte(Unescape(raw)))
 		return err
 	}
 

@@ -43,7 +43,22 @@ func ConfigFromEnv() (CPConfig, error) {
 	if len(missing) > 0 {
 		return CPConfig{}, fmt.Errorf("missing required environment variables: %s", strings.Join(missing, ", "))
 	}
+	warnIfNotHTTPS(cfg.URL)
 	return cfg, nil
+}
+
+// warnIfNotHTTPS prints a one-line warning to stderr — never an error, this
+// scheme is still allowed — when FACETS_CP_URL doesn't use https. An
+// in-cluster stub or sidecar control-plane endpoint reached over plain HTTP
+// inside a trusted mesh is a legitimate setup, but basic-auth credentials
+// (and every resolved output) going out in cleartext to anything else is
+// worth flagging loudly rather than staying silent about it.
+func warnIfNotHTTPS(rawURL string) {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme == "" || u.Scheme == "https" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "facets-resolver: warning: FACETS_CP_URL %q does not use https — control-plane credentials and responses will be sent in cleartext\n", rawURL)
 }
 
 // CPClient is a minimal Facets control-plane client.
@@ -56,6 +71,12 @@ type CPClient struct {
 func NewCPClient(cfg CPConfig) *CPClient {
 	return &CPClient{cfg: cfg, http: &http.Client{Timeout: 30 * time.Second}}
 }
+
+// cpResponseLimit caps how much of a control-plane response body this client
+// will ever read — including a successful response, not just an error body —
+// so a misbehaving or compromised control-plane endpoint can't exhaust this
+// process's memory via an unbounded response.
+const cpResponseLimit = 20 << 20 // 20MB
 
 func (c *CPClient) get(path string, out any) error {
 	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(c.cfg.URL, "/")+path, nil)
@@ -72,7 +93,15 @@ func (c *CPClient) get(path string, out any) error {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return fmt.Errorf("GET %s: status %d: %s", path, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	// UseNumber: decode JSON numbers as json.Number (exact decimal text)
+	// instead of float64, so a large integer (e.g. an 18-digit account or
+	// resource ID) isn't silently corrupted by float64's ~15-17 significant
+	// digit precision on its way through this client. resolver.go threads
+	// json.Number through whole-ref injection and embedded stringification
+	// so it round-trips into the rendered manifest exactly.
+	dec := json.NewDecoder(io.LimitReader(resp.Body, cpResponseLimit))
+	dec.UseNumber()
+	return dec.Decode(out)
 }
 
 func (c *CPClient) environmentID(project, environment string) (string, error) {
