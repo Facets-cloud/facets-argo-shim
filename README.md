@@ -22,13 +22,60 @@ manifest stream regardless of how the chart produced them.
 
 ## Ref syntax and typing rules
 
+Two ref forms are recognized: resource-output refs and blueprint-scoped
+refs. Both share the same typing/escaping rules below.
+
+### Resource-output refs
+
     ${facets:<type>.<name>.out.<path...>}
 
 - `<type>.<name>` identifies a Facets resource (e.g. `sqs.orders`).
 - `<path...>` walks its `out` block, e.g. `attributes.queue_url` or
   `interfaces.reader.connection_string`.
-- Every path segment must be non-empty; a malformed ref is a hard error —
-  nothing partially resolved is ever emitted.
+
+### Blueprint-scoped refs
+
+    ${facets:blueprint.self.variables.<NAME>}
+    ${facets:blueprint.self.secrets.<NAME>}
+    ${facets:blueprint.self.artifacts.<NAME>}
+
+`self` always means the same project/environment every other ref in the
+render resolves against (per "Coordinate resolution" below) — there is no
+cross-project or cross-environment blueprint ref.
+
+- **`.variables.<NAME>`** — the project variable's effective value for the
+  annotated environment. Referencing a variable that's actually a secret
+  through this form is a hard error suggesting `.secrets.` instead — it
+  never silently leaks a secret's presence or value through the wrong ref
+  class.
+- **`.secrets.<NAME>`** — the secret's value for the annotated environment.
+  Referencing a non-secret through this form is a hard error suggesting
+  `.variables.` instead. A secret that exists but has no value actually set
+  for this environment (status other than `OVERRIDDEN`) is a hard error
+  naming the secret and environment — never an empty string standing in for
+  "unset".
+  > **Prominent warning**: a `.secrets.` ref places the secret's actual
+  > VALUE into the rendered manifest — the same manifest Argo CD stores,
+  > diffs, and shows in its UI. Use `.secrets.` refs only inside manifests
+  > of `kind: Secret` (where that visibility is already expected and
+  > access-controlled the same way any other Kubernetes Secret is), or
+  > prefer an external secret manager (e.g. External Secrets Operator, a
+  > cloud provider's secret-injection webhook) that never puts the value in
+  > a `helm template` render or an Argo CD diff at all. Do not use
+  > `.secrets.` refs to populate a `ConfigMap`, an env var block on a
+  > `Deployment`, or any other non-`Secret` manifest.
+- **`.artifacts.<NAME>`** — the artifact's effective container image URI for
+  the annotated environment (`<NAME>` is the artifact's CI integration
+  name). Resolved by precedence: an `ENVIRONMENT`-registered URI for this
+  exact environment, else a `RELEASE_STREAM`-registered URI for this
+  environment's release stream, else a single unscoped default registration
+  if one exists. No matching registration is a hard error listing every
+  registration the artifact actually has.
+
+### Typing, embedding, and escaping (both forms)
+
+- Every path/name segment must be non-empty; a malformed ref is a hard error
+  — nothing partially resolved is ever emitted.
 - **Whole-scalar ref** (the entire YAML scalar is exactly one ref, e.g.
   `replicas: ${facets:service.api.out.attributes.replicas}`): the resolved
   value is injected with its native type (number, bool, string, or a nested
@@ -117,6 +164,16 @@ run. This is a legitimate way to stage a rollout: install the shim first,
 confirm it's a no-op for every existing Application, then grant the RBAC
 once you're ready for `${facets:...}` refs to actually resolve.
 
+**A separate, CP-side permission for `blueprint.self.secrets.*` refs**:
+resolving a secret's actual value (not just proving it exists) requires the
+`FACETS_CP_USERNAME`/`FACETS_CP_TOKEN` identity itself to hold Facets'
+`VIEW_SECRETS` permission on the project. This is entirely independent of
+the Kubernetes RBAC above — it's enforced by the Facets control plane, not
+by anything in this repo — and is exactly the same permission `raptor get
+variables --show-secrets` requires. Without it, any `.secrets.` ref fails
+closed with the control plane's own authorization error; `.variables.` and
+`.artifacts.` refs are unaffected.
+
 ## Install footprint
 
 `argocd-repo-server` needs:
@@ -186,7 +243,7 @@ repoServer:
       volumeMounts:
         - {name: custom-tools, mountPath: /custom-tools}
     - name: copy-facets-tools
-      image: docker.io/facetscloud/facets-argo-shim:v0.11
+      image: docker.io/facetscloud/facets-argo-shim:v0.12
       command: [sh, -c, "cp /opt/facets/facets-resolver /custom-tools/ && cp /opt/facets/helm-shim.sh /custom-tools/helm-shim && chmod 755 /custom-tools/*"]
       volumeMounts:
         - {name: custom-tools, mountPath: /custom-tools}
@@ -264,7 +321,7 @@ spec:
           volumeMounts:
             - {name: custom-tools, mountPath: /custom-tools}
         - name: copy-facets-tools
-          image: docker.io/facetscloud/facets-argo-shim:v0.11
+          image: docker.io/facetscloud/facets-argo-shim:v0.12
           command: [sh, -c, "cp /opt/facets/facets-resolver /custom-tools/ && cp /opt/facets/helm-shim.sh /custom-tools/helm-shim && chmod 755 /custom-tools/*"]
           volumeMounts:
             - {name: custom-tools, mountPath: /custom-tools}
@@ -306,9 +363,12 @@ no fields to any Application.
   release name it looked for.
 - Resolved values land in plaintext in the rendered manifests Argo CD
   applies, diffs, and shows in its UI — the same as any other Helm value.
-  `${facets:...}` refs are for plain configuration, not secrets: route
-  anything secret-shaped (credentials, tokens, keys) through Kubernetes
-  `Secret` objects or an external secret manager instead, not through a ref
-  resolved into a `ConfigMap` or pod spec.
+  Resource-output refs and `blueprint.self.variables.*` refs are for plain
+  configuration; route anything secret-shaped through either a
+  `blueprint.self.secrets.*` ref placed only in a `kind: Secret` manifest
+  (see the prominent warning under "Blueprint-scoped refs" above), or
+  through an external secret manager instead — never through a
+  resource-output or `.variables.` ref resolved into a `ConfigMap` or pod
+  spec.
 - No CMP mode, no kustomize support, no plain-directory support — helm-only,
   by design.

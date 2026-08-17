@@ -1,8 +1,10 @@
 // resolver.go
-// ${facets:<type>.<name>.out.<path...>} reference parsing and resolution:
-// finding refs in text, the $$-escape convention, and resolving every ref in
-// a multi-document YAML manifest stream against a Facets control plane via a
-// LookupFunc.
+// ${facets:...} reference parsing and resolution, in two grammars —
+// resource output (${facets:<type>.<name>.out.<path...>}) and blueprint-
+// scoped (${facets:blueprint.self.<variables|secrets|artifacts>.<name>},
+// see the Ref/RefKind doc comments below — finding refs in text, the
+// $$-escape convention, and resolving every ref in a multi-document YAML
+// manifest stream against a Facets control plane via a LookupFunc.
 package main
 
 import (
@@ -30,12 +32,37 @@ import (
 // fail-closed net that catches exactly that gap downstream.
 var refPattern = regexp.MustCompile(`\$\{facets:([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+)\}`)
 
-// Ref is one ${facets:<type>.<name>.out.<path...>} reference.
+// RefKind distinguishes the two ref grammars Find recognizes. The zero
+// value, RefKindOutput, is deliberately the common <type>.<name>.out.<path>
+// resource-output form, so existing Ref literals that don't set Kind
+// (throughout this codebase's own tests) keep meaning exactly what they
+// meant before blueprint-scoped refs existed.
+type RefKind int
+
+const (
+	RefKindOutput            RefKind = iota // <type>.<name>.out.<path...>
+	RefKindBlueprintVariable                // blueprint.self.variables.<name>
+	RefKindBlueprintSecret                  // blueprint.self.secrets.<name>
+	RefKindBlueprintArtifact                // blueprint.self.artifacts.<name>
+)
+
+// Ref is one ${facets:...} reference, in one of two grammars:
+//
+//   - Resource output: ${facets:<type>.<name>.out.<path...>} (Kind ==
+//     RefKindOutput; ResourceType, ResourceName, Path are populated).
+//   - Blueprint-scoped: ${facets:blueprint.self.<class>.<name>}, where
+//     <class> is variables/secrets/artifacts (Kind ==
+//     RefKindBlueprint{Variable,Secret,Artifact}; Name is populated). "self"
+//     always means the same project/environment the render's other refs
+//     resolve against — there is no cross-project or cross-environment
+//     blueprint ref.
 type Ref struct {
 	Raw          string // the full ${facets:...} match
-	ResourceType string
-	ResourceName string
-	Path         []string // segments after "out", e.g. ["attributes","queue_url"]
+	Kind         RefKind
+	ResourceType string   // RefKindOutput only
+	ResourceName string   // RefKindOutput only
+	Path         []string // RefKindOutput only: segments after "out", e.g. ["attributes","queue_url"]
+	Name         string   // blueprint-scoped kinds only: the variable/secret/artifact name
 }
 
 // Find returns all refs in s in order of appearance. A ref preceded by an
@@ -52,6 +79,37 @@ func Find(s string) ([]Ref, error) {
 		raw := s[m[0]:m[1]]
 		expr := s[m[2]:m[3]]
 		parts := strings.Split(expr, ".")
+
+		// blueprint.self.<class>.<name> — a reserved prefix, checked before
+		// the resource-output grammar below, so e.g.
+		// ${facets:blueprint.self.out.x} is rejected as an invalid
+		// blueprint.self ref rather than treated as a (nonsensical) output
+		// ref for a resource literally named type "blueprint", name "self".
+		if len(parts) >= 2 && parts[0] == "blueprint" && parts[1] == "self" {
+			if len(parts) != 4 {
+				errs = append(errs, fmt.Sprintf("invalid facets ref %q: want ${facets:blueprint.self.<variables|secrets|artifacts>.<name>}", raw))
+				continue
+			}
+			var kind RefKind
+			switch parts[2] {
+			case "variables":
+				kind = RefKindBlueprintVariable
+			case "secrets":
+				kind = RefKindBlueprintSecret
+			case "artifacts":
+				kind = RefKindBlueprintArtifact
+			default:
+				errs = append(errs, fmt.Sprintf("invalid facets ref %q: blueprint.self class must be one of variables, secrets, artifacts (got %q)", raw, parts[2]))
+				continue
+			}
+			if parts[3] == "" {
+				errs = append(errs, fmt.Sprintf("invalid facets ref %q: want ${facets:blueprint.self.<variables|secrets|artifacts>.<name>}", raw))
+				continue
+			}
+			out = append(out, Ref{Raw: raw, Kind: kind, Name: parts[3]})
+			continue
+		}
+
 		if len(parts) < 4 || parts[2] != "out" {
 			errs = append(errs, fmt.Sprintf("invalid facets ref %q: want ${facets:<type>.<name>.out.<path...>}", raw))
 			continue
@@ -68,7 +126,7 @@ func Find(s string) ([]Ref, error) {
 			errs = append(errs, fmt.Sprintf("invalid facets ref %q: want ${facets:<type>.<name>.out.<path...>}", raw))
 			continue
 		}
-		out = append(out, Ref{Raw: raw, ResourceType: parts[0], ResourceName: parts[1], Path: parts[3:]})
+		out = append(out, Ref{Raw: raw, Kind: RefKindOutput, ResourceType: parts[0], ResourceName: parts[1], Path: parts[3:]})
 	}
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("%s", strings.Join(errs, "; "))

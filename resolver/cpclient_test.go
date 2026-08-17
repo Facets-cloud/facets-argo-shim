@@ -4,6 +4,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -202,6 +203,242 @@ func TestLookupBigIntegerRoundTripsExactly(t *testing.T) {
 	}
 	if m["ratioEmbedded"] != "r-1.5" {
 		t.Fatalf("ratioEmbedded = %#v, want %q", m["ratioEmbedded"], "r-1.5")
+	}
+}
+
+// --- Blueprint-scoped refs: variables, secrets, artifacts ---
+
+// blueprintStub serves every endpoint blueprint.self.* refs need: the
+// existing clusters/environmentID lookup, varsWithStatus, per-secret
+// environment values, the artifact CI list, per-artifact registrations, and
+// clusters-overview (for release-stream matching). Coordinates:
+// project "bp-project", environment "bp-dev" (cluster ID "bp-env-1"),
+// release stream "stable".
+func blueprintStub(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/cc-ui/v1/stacks/bp-project/clusters":
+			json.NewEncoder(w).Encode([]map[string]string{{"id": "bp-env-1", "name": "bp-dev"}})
+		case r.URL.Path == "/cc-ui/v1/clusters/bp-env-1/varsWithStatus":
+			json.NewEncoder(w).Encode(map[string]any{
+				"DB_HOST":      map[string]any{"value": "db.internal", "secret": false, "status": "DEFAULT"},
+				"REPLICAS":     map[string]any{"value": 3, "secret": false, "status": "DEFAULT"},
+				"API_KEY":      map[string]any{"secret": true, "status": "OVERRIDDEN"},
+				"UNSET_SECRET": map[string]any{"secret": true, "status": "NOT_SET"},
+			})
+		case r.URL.Path == "/cc-ui/v1/stacks/bp-project/variables/API_KEY/environments":
+			json.NewEncoder(w).Encode(map[string]any{
+				"environmentValues": []map[string]any{
+					{"environmentName": "bp-dev", "status": "OVERRIDDEN", "value": "sk-secret-value"},
+				},
+			})
+		case r.URL.Path == "/cc-ui/v1/stacks/bp-project/variables/UNSET_SECRET/environments":
+			json.NewEncoder(w).Encode(map[string]any{
+				"environmentValues": []map[string]any{
+					{"environmentName": "bp-dev", "status": "NOT_SET", "value": ""},
+				},
+			})
+		case r.URL.Path == "/cc-ui/v1/artifacts-ci/blueprint/bp-project":
+			json.NewEncoder(w).Encode([]map[string]any{
+				{"ciName": "web", "registrationType": "ENVIRONMENT"},
+				{"ciName": "worker", "registrationType": "RELEASE_STREAM"},
+				{"ciName": "orphan", "registrationType": "GIT_REF"},
+			})
+		case r.URL.Path == "/cc-ui/v1/artifacts-ci/web/artifacts":
+			json.NewEncoder(w).Encode([]map[string]any{
+				{"artifactId": "1", "artifactUri": "registry/web:env-tag", "registrationType": "ENVIRONMENT", "registrationValue": "bp-env-1"},
+				{"artifactId": "2", "artifactUri": "registry/web:other-env-tag", "registrationType": "ENVIRONMENT", "registrationValue": "bp-env-2"},
+			})
+		case r.URL.Path == "/cc-ui/v1/artifacts-ci/worker/artifacts":
+			json.NewEncoder(w).Encode([]map[string]any{
+				{"artifactId": "3", "artifactUri": "registry/worker:stream-tag", "registrationType": "RELEASE_STREAM", "registrationValue": "stable"},
+			})
+		case r.URL.Path == "/cc-ui/v1/artifacts-ci/orphan/artifacts":
+			json.NewEncoder(w).Encode([]map[string]any{
+				{"artifactId": "4", "artifactUri": "registry/orphan:some-ref", "registrationType": "GIT_REF", "registrationValue": "refs/heads/main"},
+			})
+		case r.URL.Path == "/cc-ui/v1/stacks/bp-project/clusters-overview":
+			json.NewEncoder(w).Encode([]map[string]any{
+				{"cluster": map[string]any{"id": "bp-env-1", "name": "bp-dev", "releaseStream": "stable"}},
+			})
+		default:
+			http.Error(w, r.URL.Path, http.StatusNotFound)
+		}
+	}))
+}
+
+func blueprintClient(t *testing.T, srv *httptest.Server) LookupFunc {
+	t.Helper()
+	c := NewCPClient(CPConfig{URL: srv.URL, Username: "u", Token: "t"})
+	return c.Lookup("bp-project", "bp-dev")
+}
+
+func TestLookupBlueprintVariableHappyPathTyped(t *testing.T) {
+	srv := blueprintStub(t)
+	defer srv.Close()
+	look := blueprintClient(t, srv)
+
+	v, err := look(mustRef(t, "${facets:blueprint.self.variables.DB_HOST}"))
+	if err != nil || v != "db.internal" {
+		t.Fatalf("v=%v err=%v", v, err)
+	}
+
+	// Typed: a numeric variable round-trips as an actual integer, not a
+	// quoted string, through ResolveStream (same json.Number machinery as
+	// resource outputs).
+	out, err := ResolveStream([]byte("replicas: ${facets:blueprint.self.variables.REPLICAS}\n"), look)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := yaml.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	switch v := m["replicas"].(type) {
+	case int, int64, uint64:
+	default:
+		t.Fatalf("replicas = %#v (%T), want an integer type; output:\n%s", v, v, out)
+	}
+}
+
+func TestLookupBlueprintVariableNotFound(t *testing.T) {
+	srv := blueprintStub(t)
+	defer srv.Close()
+	look := blueprintClient(t, srv)
+
+	_, err := look(mustRef(t, "${facets:blueprint.self.variables.NOPE}"))
+	if err == nil || !strings.Contains(err.Error(), "NOPE") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// TestLookupBlueprintVariableClassMismatch: a secret referenced via
+// .variables. is a hard error suggesting .secrets. instead — never the
+// secret's presence/absence leaking through the wrong ref form.
+func TestLookupBlueprintVariableClassMismatch(t *testing.T) {
+	srv := blueprintStub(t)
+	defer srv.Close()
+	look := blueprintClient(t, srv)
+
+	_, err := look(mustRef(t, "${facets:blueprint.self.variables.API_KEY}"))
+	if err == nil || !strings.Contains(err.Error(), ".secrets.") {
+		t.Fatalf("err = %v, want it to suggest .secrets.", err)
+	}
+}
+
+func TestLookupBlueprintSecretHappyPath(t *testing.T) {
+	srv := blueprintStub(t)
+	defer srv.Close()
+	look := blueprintClient(t, srv)
+
+	v, err := look(mustRef(t, "${facets:blueprint.self.secrets.API_KEY}"))
+	if err != nil || v != "sk-secret-value" {
+		t.Fatalf("v=%v err=%v", v, err)
+	}
+}
+
+// TestLookupBlueprintSecretClassMismatch: a non-secret referenced via
+// .secrets. is a hard error suggesting .variables. instead.
+func TestLookupBlueprintSecretClassMismatch(t *testing.T) {
+	srv := blueprintStub(t)
+	defer srv.Close()
+	look := blueprintClient(t, srv)
+
+	_, err := look(mustRef(t, "${facets:blueprint.self.secrets.DB_HOST}"))
+	if err == nil || !strings.Contains(err.Error(), ".variables.") {
+		t.Fatalf("err = %v, want it to suggest .variables.", err)
+	}
+}
+
+func TestLookupBlueprintSecretNotSet(t *testing.T) {
+	srv := blueprintStub(t)
+	defer srv.Close()
+	look := blueprintClient(t, srv)
+
+	_, err := look(mustRef(t, "${facets:blueprint.self.secrets.UNSET_SECRET}"))
+	if err == nil || !strings.Contains(err.Error(), "UNSET_SECRET") || !strings.Contains(err.Error(), "bp-dev") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestLookupBlueprintArtifactEnvironmentMatch(t *testing.T) {
+	srv := blueprintStub(t)
+	defer srv.Close()
+	look := blueprintClient(t, srv)
+
+	v, err := look(mustRef(t, "${facets:blueprint.self.artifacts.web}"))
+	if err != nil || v != "registry/web:env-tag" {
+		t.Fatalf("v=%v err=%v", v, err)
+	}
+}
+
+func TestLookupBlueprintArtifactReleaseStreamMatch(t *testing.T) {
+	srv := blueprintStub(t)
+	defer srv.Close()
+	look := blueprintClient(t, srv)
+
+	v, err := look(mustRef(t, "${facets:blueprint.self.artifacts.worker}"))
+	if err != nil || v != "registry/worker:stream-tag" {
+		t.Fatalf("v=%v err=%v", v, err)
+	}
+}
+
+// TestLookupBlueprintArtifactNoMatch: a registered artifact whose only
+// registration is GIT_REF (neither ENVIRONMENT nor RELEASE_STREAM, and not
+// an unscoped default either) is a hard error listing what IS registered.
+func TestLookupBlueprintArtifactNoMatch(t *testing.T) {
+	srv := blueprintStub(t)
+	defer srv.Close()
+	look := blueprintClient(t, srv)
+
+	_, err := look(mustRef(t, "${facets:blueprint.self.artifacts.orphan}"))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "orphan") || !strings.Contains(err.Error(), "GIT_REF") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestLookupBlueprintArtifactUnknownName(t *testing.T) {
+	srv := blueprintStub(t)
+	defer srv.Close()
+	look := blueprintClient(t, srv)
+
+	_, err := look(mustRef(t, "${facets:blueprint.self.artifacts.nope}"))
+	if err == nil || !strings.Contains(err.Error(), "nope") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// TestLookupBlueprintVarsFetchedOnce proves varsWithStatus is fetched at
+// most once per render even across mixed variables/secrets refs.
+func TestLookupBlueprintVarsFetchedOnce(t *testing.T) {
+	var calls atomic.Int32
+	base := blueprintStub(t)
+	defer base.Close()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/cc-ui/v1/clusters/bp-env-1/varsWithStatus" {
+			calls.Add(1)
+		}
+		resp, err := http.Get(base.URL + r.URL.Path)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		io.Copy(w, resp.Body)
+	}))
+	defer srv.Close()
+	c := NewCPClient(CPConfig{URL: srv.URL, Username: "u", Token: "t"})
+	look := c.Lookup("bp-project", "bp-dev")
+
+	look(mustRef(t, "${facets:blueprint.self.variables.DB_HOST}"))
+	look(mustRef(t, "${facets:blueprint.self.secrets.API_KEY}"))
+	look(mustRef(t, "${facets:blueprint.self.variables.REPLICAS}"))
+	if calls.Load() != 1 {
+		t.Fatalf("varsWithStatus fetched %d times, want 1", calls.Load())
 	}
 }
 

@@ -92,6 +92,43 @@ func TestFindSkipsMalformedGrammarWithoutMatching(t *testing.T) {
 	}
 }
 
+func TestFindParsesBlueprintRefs(t *testing.T) {
+	got, err := Find("v: ${facets:blueprint.self.variables.DB_HOST} s: ${facets:blueprint.self.secrets.API_KEY} a: ${facets:blueprint.self.artifacts.web}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Ref{
+		{Raw: "${facets:blueprint.self.variables.DB_HOST}", Kind: RefKindBlueprintVariable, Name: "DB_HOST"},
+		{Raw: "${facets:blueprint.self.secrets.API_KEY}", Kind: RefKindBlueprintSecret, Name: "API_KEY"},
+		{Raw: "${facets:blueprint.self.artifacts.web}", Kind: RefKindBlueprintArtifact, Name: "web"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %+v want %+v", got, want)
+	}
+}
+
+// TestFindRejectsMalformedBlueprintRefs proves a blueprint.self ref whose
+// class isn't one of variables/secrets/artifacts, or whose segment count is
+// wrong, is a hard error naming the valid classes — never silently
+// misparsed as (or falling through to) a resource-output ref, even when
+// parts[2] happens to be "out" (a resource type/name literally "blueprint"/
+// "self" is not reachable via this grammar; it's reserved).
+func TestFindRejectsMalformedBlueprintRefs(t *testing.T) {
+	for _, s := range []string{
+		"${facets:blueprint.self.out.x}",             // "out" is not a valid blueprint class
+		"${facets:blueprint.self.envvars.DB_HOST}",   // not one of the three classes
+		"${facets:blueprint.self.variables}",         // missing name (3 segments)
+		"${facets:blueprint.self}",                   // missing class and name (2 segments)
+		"${facets:blueprint.self.variables.X.extra}", // too many segments (5)
+	} {
+		if _, err := Find(s); err == nil {
+			t.Fatalf("expected error for %q", s)
+		} else if !strings.Contains(err.Error(), "variables, secrets, artifacts") && !strings.Contains(err.Error(), "blueprint.self.<variables|secrets|artifacts>") {
+			t.Fatalf("%q: error doesn't name the valid classes: %v", s, err)
+		}
+	}
+}
+
 func TestUnescape(t *testing.T) {
 	if got := Unescape("a $${facets:x.y.out.z} b"); got != "a ${facets:x.y.out.z} b" {
 		t.Fatalf("got %q", got)
