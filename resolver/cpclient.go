@@ -105,19 +105,23 @@ func (c *CPClient) get(path string, out any) error {
 	return dec.Decode(out)
 }
 
-// post issues an authenticated POST with a JSON body, discarding any
+// put issues an authenticated PUT with a JSON body, discarding any
 // response body beyond checking the status code. Used only by the v0.13
 // consumed-references callback (callback.go) — every write this client ever
-// makes goes through here. A non-2xx status (including 401/403 from a
-// read-only CP token, which has no write access to the blueprint) surfaces
-// as an error for the caller to treat as best-effort: see callback.go and
-// main.go's run for why a failure here never fails the render itself.
-func (c *CPClient) post(path string, body any) error {
+// makes goes through here. PUT, not POST: the designer/v2 resources
+// endpoint treats POST as create-only (a live POST against an existing
+// resource returns 400 "File already exists at <path>"); raptor's own
+// apply.go issues updates with apiClient.Put and creates with Post. A
+// non-2xx status (including 401/403 from a read-only CP token, which has no
+// write access to the blueprint) surfaces as an error for the caller to
+// treat as best-effort: see callback.go and main.go's run for why a failure
+// here never fails the render itself.
+func (c *CPClient) put(path string, body any) error {
 	buf, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("encoding request body: %w", err)
 	}
-	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(c.cfg.URL, "/")+path, bytes.NewReader(buf))
+	req, err := http.NewRequest(http.MethodPut, strings.TrimRight(c.cfg.URL, "/")+path, bytes.NewReader(buf))
 	if err != nil {
 		return err
 	}
@@ -130,7 +134,7 @@ func (c *CPClient) post(path string, body any) error {
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("POST %s: status %d: %s", path, resp.StatusCode, strings.TrimSpace(string(respBody)))
+		return fmt.Errorf("PUT %s: status %d: %s", path, resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
 	return nil
 }

@@ -88,6 +88,14 @@ func callbackCPStub(t *testing.T, postCalls *atomic.Int32, lastPostBody *[]byte,
 		case "/cc-ui/v1/stacks/cb-project":
 			json.NewEncoder(w).Encode(map[string]any{"branch": "main"})
 		case "/cc-ui/v1/designer/v2/cb-project/resources":
+			// The real endpoint treats POST as create-only and 400s on an
+			// existing resource ("File already exists at <path>") — the
+			// callback always updates an existing resource, so anything but
+			// PUT here is the exact live bug this guard exists to catch.
+			if r.Method != http.MethodPut {
+				http.Error(w, "designer/v2 update must be PUT (POST is create-only)", http.StatusBadRequest)
+				return
+			}
 			if postCalls != nil {
 				postCalls.Add(1)
 			}

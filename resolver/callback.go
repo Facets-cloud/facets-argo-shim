@@ -168,9 +168,11 @@ func fetchResourceContent(client *CPClient, project, resourceType, resourceName 
 // resource in the "resources" array, with the project's own branch (raptor
 // defaults to "main" when the project has none set; see
 // CPClient.projectBranch) and a commit message naming the Application that
-// triggered this write. NOTE: apply.go issues this as an HTTP POST
-// (apiClient.Post), not a PUT — verified against the actual client call,
-// not assumed from the "update" framing.
+// triggered this write. NOTE: this must be an HTTP PUT — the endpoint
+// treats POST as create-only, and a POST against a resource that already
+// exists (always the case here, since fetchResourceContent just found it)
+// fails with 400 "File already exists at <path>". Matches raptor's apply.go,
+// which Puts update batches and Posts only create batches.
 func writeResourceContent(client *CPClient, project, resourceType, resourceName string, resource map[string]any, appName string) error {
 	branch, err := client.projectBranch(project)
 	if err != nil {
@@ -188,5 +190,5 @@ func writeResourceContent(client *CPClient, project, resourceType, resourceName 
 	}
 
 	path := fmt.Sprintf("/cc-ui/v1/designer/v2/%s/resources", url.PathEscape(project))
-	return client.post(path, body)
+	return client.put(path, body)
 }

@@ -357,7 +357,7 @@ repoServer:
       volumeMounts:
         - {name: custom-tools, mountPath: /custom-tools}
     - name: copy-facets-tools
-      image: docker.io/facetscloud/facets-argo-shim:v0.13
+      image: docker.io/facetscloud/facets-argo-shim:v0.13.1
       command: [sh, -c, "cp /opt/facets/facets-resolver /custom-tools/ && cp /opt/facets/helm-shim.sh /custom-tools/helm-shim && chmod 755 /custom-tools/*"]
       volumeMounts:
         - {name: custom-tools, mountPath: /custom-tools}
@@ -435,7 +435,7 @@ spec:
           volumeMounts:
             - {name: custom-tools, mountPath: /custom-tools}
         - name: copy-facets-tools
-          image: docker.io/facetscloud/facets-argo-shim:v0.13
+          image: docker.io/facetscloud/facets-argo-shim:v0.13.1
           command: [sh, -c, "cp /opt/facets/facets-resolver /custom-tools/ && cp /opt/facets/helm-shim.sh /custom-tools/helm-shim && chmod 755 /custom-tools/*"]
           volumeMounts:
             - {name: custom-tools, mountPath: /custom-tools}
