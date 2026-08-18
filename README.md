@@ -123,6 +123,107 @@ If a rendered stream has zero `${facets:...}` refs, none of the above runs
 at all — no kube client, no CP call, no flag is even read. The stream is
 only passed through the `$$`-unescape step.
 
+## Reporting consumed references back to Facets
+
+**Why this exists**: without it, a Facets release that changes a value a
+`${facets:...}` ref resolves to has no way to reach an already-deployed
+Argo `Application` — Argo only re-syncs when the `Application` CR (or the
+Git content its Helm source points at) actually changes, and this shim
+resolves refs at *render* time, not by mutating the CR itself. This
+callback closes that loop: after a render succeeds, it reports every
+distinct `${facets:...}` expression the render consumed back to the
+blueprint resource that owns the Application, in native blueprint
+expression syntax. The resource's own module can then evaluate those same
+expressions as ordinary blueprint inputs and fold the resolved values into
+the Application CR as static `spec` fields (e.g. into `valuesObject` or a
+templated field) — so a Facets release that changes any of them mutates the
+CR itself, Argo re-renders naturally on its own watch of that CR, and no
+refresh/webhook machinery is needed anywhere in this shim.
+
+**Opt-in, three additional annotations** — the callback is enabled only
+when the matched Application carries all three, alongside the existing
+`facets.cloud/project`/`facets.cloud/environment` pair:
+
+    metadata:
+      annotations:
+        facets.cloud/project: demo-project
+        facets.cloud/environment: dev
+        facets.cloud/resource-type: argocd_application
+        facets.cloud/resource-name: my-app
+        facets.cloud/references-field: facets_references
+
+- `facets.cloud/resource-type` / `facets.cloud/resource-name` — identify the
+  blueprint resource (the same `resourceType`/`resourceName` pair `raptor
+  get resources` would show) that produced this Application, so the
+  callback knows which resource to update.
+- `facets.cloud/references-field` — the `spec` field on that resource to
+  write the consumed-expressions payload into (e.g. `facets_references`) —
+  the module's own `facets.yaml` defines this field and reads it back as
+  input.
+
+Zero of the three present is the ordinary case (the callback is simply not
+configured for that Application) and is silent. One or two present is
+almost certainly a typo or incomplete setup — that's a stderr warning
+naming exactly which annotation(s) are missing, with the render otherwise
+unaffected.
+
+**What gets written**: every ref actually present anywhere in the rendered
+stream, deduplicated and converted to native blueprint expression syntax
+(the `facets:` prefix this shim's own `${facets:...}` wrapper adds is
+stripped), sorted lexicographically for a deterministic payload — keyed by
+**environment name**, since one blueprint resource is typically shared
+across many environments (dev/staging/prod, ...) via one Argo Application
+per environment, and each of those needs its own, potentially different,
+expression set:
+
+    ${dynamodb.state-lock.out.attributes.table_name}
+    ${blueprint.self.variables.logo_url}
+
+resolved by the Application annotated `facets.cloud/environment: dev`, is
+reported as:
+
+    {
+      "dev": { "expressions": ["${blueprint.self.variables.logo_url}", "${dynamodb.state-lock.out.attributes.table_name}"] }
+    }
+
+written to `spec.<references-field>` on the named blueprint resource. This
+is a **merge at the environment key, never a wholesale replacement of the
+field**: if the field already has a `"prod"` section from a previous render
+of the prod Application, that section is left completely untouched — only
+`spec.<references-field>.<this render's environment>` is ever read,
+compared, and (if needed) replaced. If that one environment's section
+already deep-equals the value being computed, nothing is written at all —
+no API call, no commit — so a stable Application produces zero blueprint
+commits on every subsequent render.
+
+The references field — and even `spec` itself — is created from scratch,
+not assumed to already exist: the very first render for a given
+environment (or the first render ever, for a resource whose `spec` has
+never had anything written to it) still writes correctly, adding exactly
+the one environment's section rather than requiring the field to be
+pre-seeded. The one thing this callback deliberately refuses to guess at is
+a resource with **no content at all** — not even `kind`/`flavor` — since
+fabricating those from nothing risks writing back an incomplete or wrong
+document; that case is treated the same as any other read failure (a
+warning, callback skipped, render unaffected).
+
+**FAILURE SEMANTICS — different from everything else in this shim.** Every
+other failure mode in facets-resolver fails the render closed: a malformed
+ref, unresolvable coordinates, an unreachable control plane. This callback
+is the one deliberate exception. It only ever runs *after* resolution has
+already succeeded — the manifests on stdout are already complete and
+correct by the time it fires — so a callback failure (the control plane
+unreachable, the blueprint resource not found, or a **read-only CP token
+with no write access to the blueprint**, which fails the same way a
+permissions error normally would) is logged as a stderr warning and
+swallowed. The render still exits 0 with the fully resolved manifests on
+stdout, untouched. Reporting must never break a deploy — worst case, the
+Application CR simply doesn't get its static inputs updated until the next
+render succeeds in reporting them.
+
+The callback fires at most once per render, after `ResolveStream` succeeds
+and before its output is written to stdout.
+
 ## Security posture
 
 Per-Application coordinate resolution needs `argocd-repo-server`'s own
@@ -173,6 +274,19 @@ by anything in this repo — and is exactly the same permission `raptor get
 variables --show-secrets` requires. Without it, any `.secrets.` ref fails
 closed with the control plane's own authorization error; `.variables.` and
 `.artifacts.` refs are unaffected.
+
+**A separate, CP-side permission for the consumed-references callback**
+(see "Reporting consumed references back to Facets" above): every other
+capability in this repo only ever *reads* from the Facets control plane —
+this callback is the one exception, and it needs the
+`FACETS_CP_USERNAME`/`FACETS_CP_TOKEN` identity to hold WRITE access to the
+blueprint (specifically, to the resource named by
+`facets.cloud/resource-type`/`facets.cloud/resource-name`). A read-only CP
+token — otherwise sufficient for every ref this shim resolves — simply
+means this callback warns and skips on every render, exactly like the
+degraded no-token Kubernetes mode above: no error, no failed deploys, just
+static inputs on the Application CR that never get updated from a Facets
+release. Grant write access only if you actually want the callback to run.
 
 ## Install footprint
 
@@ -243,7 +357,7 @@ repoServer:
       volumeMounts:
         - {name: custom-tools, mountPath: /custom-tools}
     - name: copy-facets-tools
-      image: docker.io/facetscloud/facets-argo-shim:v0.12
+      image: docker.io/facetscloud/facets-argo-shim:v0.13
       command: [sh, -c, "cp /opt/facets/facets-resolver /custom-tools/ && cp /opt/facets/helm-shim.sh /custom-tools/helm-shim && chmod 755 /custom-tools/*"]
       volumeMounts:
         - {name: custom-tools, mountPath: /custom-tools}
@@ -321,7 +435,7 @@ spec:
           volumeMounts:
             - {name: custom-tools, mountPath: /custom-tools}
         - name: copy-facets-tools
-          image: docker.io/facetscloud/facets-argo-shim:v0.12
+          image: docker.io/facetscloud/facets-argo-shim:v0.13
           command: [sh, -c, "cp /opt/facets/facets-resolver /custom-tools/ && cp /opt/facets/helm-shim.sh /custom-tools/helm-shim && chmod 755 /custom-tools/*"]
           volumeMounts:
             - {name: custom-tools, mountPath: /custom-tools}

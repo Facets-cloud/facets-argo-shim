@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -102,6 +103,53 @@ func (c *CPClient) get(path string, out any) error {
 	dec := json.NewDecoder(io.LimitReader(resp.Body, cpResponseLimit))
 	dec.UseNumber()
 	return dec.Decode(out)
+}
+
+// post issues an authenticated POST with a JSON body, discarding any
+// response body beyond checking the status code. Used only by the v0.13
+// consumed-references callback (callback.go) — every write this client ever
+// makes goes through here. A non-2xx status (including 401/403 from a
+// read-only CP token, which has no write access to the blueprint) surfaces
+// as an error for the caller to treat as best-effort: see callback.go and
+// main.go's run for why a failure here never fails the render itself.
+func (c *CPClient) post(path string, body any) error {
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("encoding request body: %w", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(c.cfg.URL, "/")+path, bytes.NewReader(buf))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth(c.cfg.Username, c.cfg.Token)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("control plane unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("POST %s: status %d: %s", path, resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+	return nil
+}
+
+// projectBranch fetches the project's blueprint branch (used on every
+// designer/v2 resource write, mirroring raptor's own
+// getProjectBranch/apply.go behavior), defaulting to "main" when the
+// project has none set.
+func (c *CPClient) projectBranch(project string) (string, error) {
+	path := fmt.Sprintf("/cc-ui/v1/stacks/%s", url.PathEscape(project))
+	var stack map[string]any
+	if err := c.get(path, &stack); err != nil {
+		return "", fmt.Errorf("getting project info: %w", err)
+	}
+	branch, _ := stack["branch"].(string)
+	if branch == "" {
+		branch = "main"
+	}
+	return branch, nil
 }
 
 func (c *CPClient) environmentID(project, environment string) (string, error) {

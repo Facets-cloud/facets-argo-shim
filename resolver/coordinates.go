@@ -40,9 +40,30 @@ import (
 const (
 	annotationProject     = "facets.cloud/project"
 	annotationEnvironment = "facets.cloud/environment"
+
+	// v0.13 optional callback annotations — see CallbackTarget's doc
+	// comment and callback.go. All three must be present for the
+	// post-render "report consumed references" callback to fire at all.
+	annotationResourceType    = "facets.cloud/resource-type"
+	annotationResourceName    = "facets.cloud/resource-name"
+	annotationReferencesField = "facets.cloud/references-field"
 )
 
 var appGVR = schema.GroupVersionResource{Group: "argoproj.io", Version: "v1alpha1", Resource: "applications"}
+
+// CallbackTarget names the blueprint resource — and the Application whose
+// render triggered this — that the v0.13 post-render callback (see
+// callback.go) should report consumed ${facets:...} expressions to. Present
+// only when the matched Application carries all three optional
+// facets.cloud/resource-type, facets.cloud/resource-name,
+// facets.cloud/references-field annotations alongside the required
+// project/environment pair.
+type CallbackTarget struct {
+	AppName         string // the matched Application's own metadata.name, for the commit message
+	ResourceType    string
+	ResourceName    string
+	ReferencesField string
+}
 
 // ConfigProvider builds the in-cluster kube config needed for the
 // per-Application LIST lookup. It's called at most once, and only when
@@ -56,21 +77,23 @@ type ConfigProvider func() (*rest.Config, error)
 // lookup, keyed on namespace+nameTemplate. Both must be non-empty — refs are
 // present in the stream (the only case this is called for), so there is no
 // meaningful fallback identity to resolve against, and an empty flag is
-// itself a hard, immediate error (no kube client is ever built for it).
-func resolveCoordinates(namespace, nameTemplate string, getKubeCfg ConfigProvider) (project, environment string, errs []error) {
+// itself a hard, immediate error (no kube client is ever built for it). cb
+// is non-nil only when the matched Application also opted into the v0.13
+// consumed-references callback (see CallbackTarget).
+func resolveCoordinates(namespace, nameTemplate string, getKubeCfg ConfigProvider) (project, environment string, cb *CallbackTarget, errs []error) {
 	if namespace == "" || nameTemplate == "" {
-		return "", "", []error{errors.New("rendered manifests contain ${facets:...} refs but --namespace and --name-template were not both provided; per-Application coordinate resolution requires both to identify the Application")}
+		return "", "", nil, []error{errors.New("rendered manifests contain ${facets:...} refs but --namespace and --name-template were not both provided; per-Application coordinate resolution requires both to identify the Application")}
 	}
 
 	argoNS := os.Getenv("FACETS_ARGOCD_NAMESPACE")
 	if argoNS == "" {
 		argoNS = "argocd"
 	}
-	p, e, err := perAppCoordinates(getKubeCfg, argoNS, namespace, nameTemplate)
+	p, e, cbTarget, err := perAppCoordinates(getKubeCfg, argoNS, namespace, nameTemplate)
 	if err != nil {
-		return "", "", []error{err}
+		return "", "", nil, []error{err}
 	}
-	return p, e, nil
+	return p, e, cbTarget, nil
 }
 
 // perAppCoordinates lists Application CRs in argoNS and looks for exactly
@@ -79,18 +102,18 @@ func resolveCoordinates(namespace, nameTemplate string, getKubeCfg ConfigProvide
 // outcome is a hard error: a Kubernetes API error, zero matches, a match
 // missing one or both facets.cloud annotations, or more than one match
 // (ambiguous).
-func perAppCoordinates(getKubeCfg ConfigProvider, argoNS, destNamespace, nameTemplate string) (project, environment string, err error) {
+func perAppCoordinates(getKubeCfg ConfigProvider, argoNS, destNamespace, nameTemplate string) (project, environment string, cb *CallbackTarget, err error) {
 	cfg, err := getKubeCfg()
 	if err != nil {
-		return "", "", fmt.Errorf("in-cluster kube config: %w", err)
+		return "", "", nil, fmt.Errorf("in-cluster kube config: %w", err)
 	}
 	dc, err := dynamic.NewForConfig(cfg)
 	if err != nil {
-		return "", "", fmt.Errorf("building dynamic client: %w", err)
+		return "", "", nil, fmt.Errorf("building dynamic client: %w", err)
 	}
 	list, err := dc.Resource(appGVR).Namespace(argoNS).List(context.Background(), metav1.ListOptions{})
 	if err != nil {
-		return "", "", fmt.Errorf("listing Applications in %s: %w", argoNS, err)
+		return "", "", nil, fmt.Errorf("listing Applications in %s: %w", argoNS, err)
 	}
 
 	var matches []*unstructured.Unstructured
@@ -104,7 +127,7 @@ func perAppCoordinates(getKubeCfg ConfigProvider, argoNS, destNamespace, nameTem
 
 	switch len(matches) {
 	case 0:
-		return "", "", fmt.Errorf("no Application found with destination namespace %q and release name %q in %s", destNamespace, nameTemplate, argoNS)
+		return "", "", nil, fmt.Errorf("no Application found with destination namespace %q and release name %q in %s", destNamespace, nameTemplate, argoNS)
 	case 1:
 		app := matches[0]
 		ann := app.GetAnnotations()
@@ -118,16 +141,62 @@ func perAppCoordinates(getKubeCfg ConfigProvider, argoNS, destNamespace, nameTem
 			missing = append(missing, annotationEnvironment)
 		}
 		if len(missing) > 0 {
-			return "", "", fmt.Errorf("Application %s/%s matches destination namespace %q and release name %q but is missing annotation(s): %s",
+			return "", "", nil, fmt.Errorf("Application %s/%s matches destination namespace %q and release name %q but is missing annotation(s): %s",
 				app.GetNamespace(), app.GetName(), destNamespace, nameTemplate, strings.Join(missing, ", "))
 		}
-		return p, e, nil
+		return p, e, callbackTarget(app), nil
 	default:
 		names := make([]string, 0, len(matches))
 		for _, m := range matches {
 			names = append(names, m.GetNamespace()+"/"+m.GetName())
 		}
-		return "", "", fmt.Errorf("ambiguous: %d Applications in %s match destination namespace %q and release name %q: %s", len(matches), argoNS, destNamespace, nameTemplate, strings.Join(names, ", "))
+		return "", "", nil, fmt.Errorf("ambiguous: %d Applications in %s match destination namespace %q and release name %q: %s", len(matches), argoNS, destNamespace, nameTemplate, strings.Join(names, ", "))
+	}
+}
+
+// callbackTarget inspects app's three optional callback annotations
+// (facets.cloud/resource-type, -resource-name, -references-field) and
+// builds a CallbackTarget only when all three are present. Zero present is
+// the ordinary, silent case (the callback simply isn't configured for this
+// Application). One or two present is very likely a typo or incomplete
+// setup, so it's worth a stderr warning naming exactly what's missing —
+// but it's a warning, not an error: it never blocks coordinate resolution
+// or the render itself, since the callback is pure best-effort reporting
+// bolted onto an already-successful render (see callback.go).
+func callbackTarget(app *unstructured.Unstructured) *CallbackTarget {
+	ann := app.GetAnnotations()
+	resourceType := ann[annotationResourceType]
+	resourceName := ann[annotationResourceName]
+	referencesField := ann[annotationReferencesField]
+
+	present := 0
+	var missing []string
+	for _, kv := range []struct{ key, val string }{
+		{annotationResourceType, resourceType},
+		{annotationResourceName, resourceName},
+		{annotationReferencesField, referencesField},
+	} {
+		if kv.val != "" {
+			present++
+		} else {
+			missing = append(missing, kv.key)
+		}
+	}
+
+	switch present {
+	case 3:
+		return &CallbackTarget{
+			AppName:         app.GetName(),
+			ResourceType:    resourceType,
+			ResourceName:    resourceName,
+			ReferencesField: referencesField,
+		}
+	case 0:
+		return nil
+	default:
+		fmt.Fprintf(os.Stderr, "facets-resolver: warning: Application %s/%s has partial facets-references callback annotations (missing: %s) — skipping consumed-reference reporting\n",
+			app.GetNamespace(), app.GetName(), strings.Join(missing, ", "))
+		return nil
 	}
 }
 

@@ -18,6 +18,13 @@
 // package doc: a lazy, per-Application live LIST lookup keyed on
 // --namespace/--name-template — the only coordinate source; there is no
 // repo-server-wide fallback.
+//
+// v0.13: when the matched Application also carries the three optional
+// facets.cloud/resource-* callback annotations, a successful resolution
+// additionally reports every consumed ${facets:...} expression back to the
+// blueprint resource that owns it — see callback.go. That reporting is
+// best-effort and never affects this binary's exit code or stdout; see
+// run's own doc comment for exactly where that boundary is.
 package main
 
 import (
@@ -53,6 +60,14 @@ func main() {
 // write the resolved stream to stdout. Fail closed throughout: a malformed
 // ref, unresolvable coordinates, or missing CP config are all hard errors —
 // nothing partially resolved ever reaches stdout.
+//
+// The one deliberate exception is the v0.13 consumed-references callback
+// (callback.go), fired after ResolveStream has already succeeded, when the
+// matched Application opted in (cb != nil): its errors are logged as a
+// stderr warning and swallowed, never joined into this function's returned
+// error and never capable of changing the exit code or the stdout write
+// below. The manifests already resolved correctly; a failure reporting that
+// fact back to the blueprint is not a reason to fail the deploy.
 func run(stdin io.Reader, stdout io.Writer, namespace, nameTemplate string, getKubeCfg ConfigProvider) error {
 	input, err := io.ReadAll(stdin)
 	if err != nil {
@@ -85,7 +100,7 @@ func run(stdin io.Reader, stdout io.Writer, namespace, nameTemplate string, getK
 		return err
 	}
 
-	project, environment, coordErrs := resolveCoordinates(namespace, nameTemplate, getKubeCfg)
+	project, environment, cb, coordErrs := resolveCoordinates(namespace, nameTemplate, getKubeCfg)
 
 	// Aggregate coordinate-resolution problems with the CP config check into
 	// one error.
@@ -98,11 +113,21 @@ func run(stdin io.Reader, stdout io.Writer, namespace, nameTemplate string, getK
 		return errors.Join(setupErrs...)
 	}
 
-	lookup := NewCPClient(cpCfg).Lookup(project, environment)
-	resolved, err := ResolveStream(input, lookup)
+	cpClient := NewCPClient(cpCfg)
+	resolved, err := ResolveStream(input, cpClient.Lookup(project, environment))
 	if err != nil {
 		return err
 	}
+
+	// v0.13 best-effort callback — see this function's doc comment above and
+	// callback.go for why an error here is only ever a warning.
+	if cb != nil {
+		if err := reportConsumedReferences(cpClient, project, environment, *cb, found); err != nil {
+			fmt.Fprintf(os.Stderr, "facets-resolver: warning: reporting consumed references to blueprint resource %s/%s failed (render succeeded regardless): %v\n",
+				cb.ResourceType, cb.ResourceName, err)
+		}
+	}
+
 	_, err = stdout.Write(resolved)
 	return err
 }

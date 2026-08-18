@@ -65,6 +65,27 @@ type Ref struct {
 	Name         string   // blueprint-scoped kinds only: the variable/secret/artifact name
 }
 
+// nativeExpr renders r in native Facets blueprint expression syntax — the
+// same syntax a module's own facets.yaml spec field uses, with the
+// "facets:" prefix this codebase's own ${facets:...} wrapper adds stripped
+// off (e.g. "${dynamodb.state-lock.out.attributes.table_name}" or
+// "${blueprint.self.variables.logo_url}"). Used by the v0.13 consumed-
+// references callback (see callback.go) to report exactly what a render
+// used, in a form the blueprint resource's own module can evaluate
+// directly.
+func (r Ref) nativeExpr() string {
+	switch r.Kind {
+	case RefKindBlueprintVariable:
+		return fmt.Sprintf("${blueprint.self.variables.%s}", r.Name)
+	case RefKindBlueprintSecret:
+		return fmt.Sprintf("${blueprint.self.secrets.%s}", r.Name)
+	case RefKindBlueprintArtifact:
+		return fmt.Sprintf("${blueprint.self.artifacts.%s}", r.Name)
+	default:
+		return fmt.Sprintf("${%s.%s.out.%s}", r.ResourceType, r.ResourceName, strings.Join(r.Path, "."))
+	}
+}
+
 // Find returns all refs in s in order of appearance. A ref preceded by an
 // extra '$' ($${facets:...}) is an escape and is skipped. Malformed refs are
 // errors — fail closed rather than passing them through to manifests.
